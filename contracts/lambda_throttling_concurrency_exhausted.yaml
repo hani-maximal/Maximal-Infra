@@ -1,0 +1,57 @@
+# Remediation contract — Lambda throttling because function or account concurrency is exhausted.
+#
+# STATUS: post-MVP / high-priority fast-follow. Requires:
+#   - add `lambda_throttling_concurrency_exhausted` to IncidentType enum
+#   - detector: CloudWatch Lambda Throttles + ConcurrentExecutions + Service Quotas
+#   - actions: rollback_lambda_alias (reversible), restore_lambda_reserved_concurrency (reversible if previous value is snapshotted), open_fix_as_code_pr
+#
+# DESIGN NOTE: Lambda throttling is a frequent outage mode for bursty workloads. Raising concurrency can
+# move the outage downstream, so bounded autonomy should only restore a previous known-good reserved
+# concurrency value or roll back a recent alias shift. New quota increases or larger concurrency changes
+# are human-reviewed.
+
+incident_type: lambda_throttling_concurrency_exhausted
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: async-api
+  function_name: async-api-handler
+  signal:
+    lambda_throttles: ">0 for 5m"
+    throttled_request_rate: ">1% for 5m"
+    concurrent_executions_near_limit: ">=95% for 5m"
+    deploy_or_config_window: "within 60m"
+    downstream_health_required: true
+
+min_confidence: 0.95
+
+allowed_actions:
+  - rollback_lambda_alias                   # if throttling correlates to a new version/alias shift
+  - restore_lambda_reserved_concurrency      # only to previous known-good value from snapshot/audit
+  - open_fix_as_code_pr                      # durable change: concurrency config / queue buffering / backpressure
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: [rollback_lambda_alias, restore_lambda_reserved_concurrency]
+    require_reversible: true
+
+verify:
+  window: 10m
+  checks:
+    - { metric: lambda_throttles,              condition: "==0 for 5m" }
+    - { metric: lambda_error_rate,             condition: "<1% for 5m" }
+    - { metric: lambda_concurrent_executions,  condition: "<90% of limit for 5m" }
+
+rollback_if_failed: true
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

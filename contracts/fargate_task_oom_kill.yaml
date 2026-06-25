@@ -1,0 +1,56 @@
+# Remediation contract — Fargate tasks killed for OutOfMemory (OOM).
+#
+# STATUS: post-MVP. Requires:
+#   - add `fargate_task_oom_kill` to IncidentType enum
+#   - detector: ECS DescribeTasks stoppedReason contains "OutOfMemoryError" (+ correlate deploy)
+#   - actions: rollback_ecs_task_definition (reversible) ; open_fix_as_code_pr (no prod write)
+#
+# DESIGN NOTE: OOM has two root causes with different safe responses.
+#   1) A recent deploy lowered the memory limit or introduced a leak -> rollback (reversible, auto-eligible).
+#   2) Legitimate growth needs a higher memory limit -> that is a CONFIG change, not a runtime
+#      action; Maximal must NOT auto-edit task-def memory in prod. It opens a fix-as-code PR
+#      (bump memory) for human review and escalates. No silent production sizing changes.
+
+incident_type: fargate_task_oom_kill
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: image-resizer
+  cluster: prod-fargate
+  signal:
+    oom_stops: ">=2 in 10m"                # tasks stopped with OutOfMemoryError
+    deploy_window: "within 60m"            # was there a recent task-def change?
+
+min_confidence: 0.95
+
+allowed_actions:
+  - rollback_ecs_task_definition           # ONLY if OOM correlates to a recent deploy
+  - open_fix_as_code_pr                     # otherwise: PR to raise memory limit (human review)
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    # Auto-rollback is allowed only when a deploy correlation exists (enforced by the
+    # contract engine + detector); the memory-bump PR path is never an autonomous prod write.
+    allowed_action_types: [rollback_ecs_task_definition]
+    require_reversible: true
+
+verify:
+  window: 15m
+  checks:
+    - { metric: ecs_oom_stops,          condition: "==0 in 10m" }
+    - { metric: ecs_running_task_count, condition: "==desired_count for 5m" }
+    - { metric: memory_utilization_p95, condition: "<85%" }
+
+rollback_if_failed: true
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

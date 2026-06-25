@@ -1,0 +1,53 @@
+# Remediation contract — Lambda duration/timeout spike after a deploy or configuration change.
+#
+# STATUS: MVP-adjacent. Requires:
+#   - add `lambda_timeout_duration_spike` to IncidentType enum
+#   - detector: Lambda Duration p95/p99 near timeout + Errors/Timeout log pattern + deploy correlation
+#   - actions: rollback_lambda_alias (reversible), open_fix_as_code_pr
+#
+# DESIGN NOTE: Increasing timeout or memory can be valid, but it is a config/cost/downstream-load change.
+# Maximal should not silently change it in production. The autonomous path is rollback when the spike
+# correlates to a recent version or alias shift; otherwise open a reviewed PR and escalate.
+
+incident_type: lambda_timeout_duration_spike
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: pdf-renderer
+  function_name: pdf-renderer-worker
+  signal:
+    duration_p95: ">90% of timeout for 5m"
+    timeout_errors: ">=1 for 5m"
+    deploy_window: "within 60m"
+
+min_confidence: 0.95
+
+allowed_actions:
+  - rollback_lambda_alias                    # only if new version/alias correlates with timeouts
+  - open_fix_as_code_pr                      # durable fix: memory/timeout/code optimization
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: [rollback_lambda_alias]
+    require_reversible: true
+
+verify:
+  window: 10m
+  checks:
+    - { metric: lambda_timeout_errors, condition: "==0 for 5m" }
+    - { metric: lambda_duration_p95,   condition: "<70% of timeout for 5m" }
+    - { metric: lambda_error_rate,     condition: "<1% for 5m" }
+
+rollback_if_failed: true
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

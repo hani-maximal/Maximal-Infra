@@ -1,0 +1,12 @@
+.git
+.terraform
+.tofu
+node_modules
+coverage
+dist
+.maximal
+test
+ui/node_modules
+*.log
+*.tfstate
+*.tfstate.*

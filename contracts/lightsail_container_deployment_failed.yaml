@@ -1,0 +1,52 @@
+# Remediation contract — Lightsail container service deployment failed.
+#
+# STATUS: post-MVP (Lightsail is read-only in the MVP). Requires:
+#   - add `lightsail_container_deployment_failed` to IncidentType enum
+#   - detector: Lightsail GetContainerServices (state == DEPLOYING stuck / FAILED;
+#     currentDeployment vs nextDeployment) + GetContainerServiceDeployments history
+#   - action: rollback_lightsail_container_deployment
+#
+# DESIGN NOTE: Lightsail container services keep a versioned deployment history, so rolling
+# back = redeploying the last ACTIVE deployment's containers via CreateContainerServiceDeployment.
+# That makes this cleanly reversible and a good fit for bounded autonomy on a single service.
+
+incident_type: lightsail_container_deployment_failed
+
+source: [aws_devops_agent, self_detect]
+
+detect:
+  service: marketing-site
+  container_service_name: marketing-site
+  signal:
+    deployment_state: [FAILED, "DEPLOYING stuck >10m"]
+    last_active_deployment_exists: true      # need a known-good version to roll back to
+
+min_confidence: 0.95
+
+allowed_actions:
+  - rollback_lightsail_container_deployment  # reversible: redeploy last ACTIVE version
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [production]
+    allowed_action_types: [rollback_lightsail_container_deployment]
+    require_reversible: true
+
+verify:
+  window: 10m
+  checks:
+    - { metric: lightsail_service_state,      condition: "==RUNNING" }
+    - { metric: lightsail_deployment_state,   condition: "==ACTIVE" }
+    - { metric: lightsail_lb_unhealthy_count, condition: "==0 for 5m" }
+
+rollback_if_failed: true
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

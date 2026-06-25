@@ -1,0 +1,55 @@
+# Remediation contract — ALB target group has unhealthy targets with no clear deploy correlation.
+#
+# STATUS: post-MVP. Requires:
+#   - add `alb_target_unhealthy_no_deploy` to IncidentType enum
+#   - detector: ELBv2 target health + ALB 5xx/target response time + deployment correlation negative
+#   - actions: force_new_ecs_deployment (partial), scale_ecs_service (reversible), detach_unhealthy_target (reversible for EC2/Lightsail), escalate
+#
+# DESIGN NOTE: This is the generic "service is down" symptom. Do not model it as "restart Tornado" or
+# any process-specific command. In Maximal, it should map to the runtime control plane: ECS/Fargate
+# force deployment or scaling, ASG/LB target detachment, or human escalation. No SSH/shell restarts.
+
+incident_type: alb_target_unhealthy_no_deploy
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: public-api
+  target_group_arn: "arn:aws:elasticloadbalancing:...:targetgroup/public-api/..."
+  signal:
+    unhealthy_host_ratio: ">25% for 5m"
+    alb_5xx_rate: ">1% for 5m"
+    deploy_window: "none within 60m"
+    min_healthy_targets: 1
+
+min_confidence: 0.95
+
+allowed_actions:
+  - force_new_ecs_deployment                 # partial reversibility; prefer approval in prod
+  - scale_ecs_service                        # reversible desired-count bump if capacity exists
+  - detach_unhealthy_target                  # reversible for instance-backed target groups
+  - escalate
+
+approval:
+  mode: always_human                         # generic unknown-cause health failures should start approval-only
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: []
+    require_reversible: true
+
+verify:
+  window: 10m
+  checks:
+    - { metric: alb_unhealthy_host_count, condition: "==0 for 5m" }
+    - { metric: alb_healthy_host_count,   condition: ">=min_healthy_targets for 5m" }
+    - { metric: alb_5xx_rate,             condition: "<0.5% for 5m" }
+
+rollback_if_failed: true
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

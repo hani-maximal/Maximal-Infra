@@ -1,0 +1,39 @@
+aws_region = "us-east-1"
+name       = "maximal"
+
+# Required. Until OIDC/Cognito is configured, use your office/VPN egress IP.
+allowed_ingress_cidrs = ["203.0.113.10/32"]
+
+# The deployed build is intentionally forced to observe because it still uses
+# the mock AWS adapter.
+maximal_mode = "observe"
+
+# Push a unique immutable tag before applying the ECS service.
+image_tag = "2026-06-25-001"
+
+# Optional TLS and DNS.
+# certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."
+# route53_zone_id = "Z0123456789ABC"
+# domain_name     = "maximal.example.com"
+
+# Empty means there is no production write path.
+remediation_role_arns = []
+
+# Optional future roles. These can be provisioned now, but the current build
+# does not assume them yet.
+# ecs_remediation_targets = {
+#   auth_api = {
+#     service_arn = "arn:aws:ecs:us-east-1:123456789012:service/prod/auth-api"
+#   }
+# }
+#
+# lambda_remediation_targets = {
+#   billing = {
+#     function_arn = "arn:aws:lambda:us-east-1:123456789012:function:billing-handler"
+#   }
+# }
+
+tags = {
+  Environment = "staging"
+  Owner       = "platform"
+}

@@ -1,0 +1,54 @@
+# Remediation contract — ECS/Fargate service unhealthy or tasks crash-looping.
+#
+# STATUS: MVP-adjacent. The MVP already ships `ecs_service_unhealthy`; this is the
+# Fargate-flavored variant with task-level signals. Reuses MVP actions; the only NEW
+# action is scale_ecs_service (reversible).
+#   - detector: ECS DescribeServices (runningCount<desiredCount) + task stop reasons + crash-loop count
+#   - actions: rollback_ecs_task_definition (reversible), force_new_ecs_deployment (partial),
+#              scale_ecs_service (reversible)
+
+incident_type: fargate_service_unhealthy
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: checkout-api
+  cluster: prod-fargate
+  signal:
+    running_below_desired: ">0 tasks short for 5m"   # runningCount < desiredCount
+    task_restarts: ">=3 in 10m"                       # crash-loop
+    steady_state_reached: false
+
+min_confidence: 0.95
+
+allowed_actions:
+  - rollback_ecs_task_definition           # reversible: revert to previous stable task def
+  - force_new_ecs_deployment               # nudge a fresh placement
+  - scale_ecs_service                      # reversible: temporary +N desired count
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    # Auto only for the cleanly reversible action; force-deploy/scale need a human
+    # unless you later promote them after proving reliability.
+    allowed_action_types: [rollback_ecs_task_definition]
+    require_reversible: true
+
+verify:
+  window: 10m
+  checks:
+    - { metric: ecs_running_task_count, condition: "==desired_count for 5m" }
+    - { metric: ecs_task_restarts,      condition: "==0 in 5m" }
+    - { metric: service_steady_state,   condition: "reached" }
+
+rollback_if_failed: true
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

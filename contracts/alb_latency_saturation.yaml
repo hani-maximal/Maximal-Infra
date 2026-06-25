@@ -1,0 +1,56 @@
+# Remediation contract — ALB-backed service latency saturation without a clear deploy regression.
+#
+# STATUS: post-MVP / bounded-autonomy candidate after per-service validation. Requires:
+#   - add `alb_latency_saturation` to IncidentType enum
+#   - detector: ALB TargetResponseTime p95/p99 + ECS CPU/memory + request count + error rate
+#   - actions: scale_ecs_service (reversible), rollback_ecs_task_definition if deploy-correlated, escalate
+#
+# DESIGN NOTE: Saturation is a common outage precursor. Scaling is reversible but can overload dependencies,
+# so auto-scale remediation must check downstream health and stay within a small max delta.
+
+incident_type: alb_latency_saturation
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: search-api
+  cluster: prod-fargate
+  target_group_arn: "arn:aws:elasticloadbalancing:...:targetgroup/search-api/..."
+  signal:
+    target_response_time_p95: ">1000ms for 5m"
+    request_count: ">baseline_p95 for 5m"
+    ecs_cpu_or_memory_high: ">85% for 5m"
+    downstream_error_rate: "<1%"
+    deploy_window: "optional"
+
+min_confidence: 0.95
+
+allowed_actions:
+  - scale_ecs_service                        # reversible temporary desired-count increase
+  - rollback_ecs_task_definition             # if deploy-correlated regression is present
+  - open_fix_as_code_pr                      # durable fix: autoscaling policy/resources
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: [scale_ecs_service, rollback_ecs_task_definition]
+    require_reversible: true
+
+verify:
+  window: 15m
+  checks:
+    - { metric: target_response_time_p95, condition: "<500ms for 10m" }
+    - { metric: alb_5xx_rate,             condition: "<0.5% for 10m" }
+    - { metric: downstream_error_rate,    condition: "<1% for 10m" }
+
+rollback_if_failed: true
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

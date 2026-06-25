@@ -1,0 +1,54 @@
+# Remediation contract — EC2 instances behind an Auto Scaling Group failing health checks.
+#
+# STATUS: post-MVP (EC2 is read-only in the MVP). Requires:
+#   - add `ec2_asg_unhealthy_hosts` to the IncidentType enum (SPEC.md §6)
+#   - detector: ELBv2 target health + ASG GroupInServiceInstances
+#   - actions: scale_out_asg (reversible), set_asg_instance_unhealthy (NOT reversible)
+#
+# DESIGN NOTE: the only *reversible* action here is scaling out (add capacity, revert
+# by scaling back in). Replacing a host by marking it unhealthy terminates it and is
+# NOT reversible, so it is gated to always_human.
+
+incident_type: ec2_asg_unhealthy_hosts
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: web-fleet
+  asg_name: web-fleet-asg
+  target_group_arn: "arn:aws:elasticloadbalancing:...:targetgroup/web-fleet/..."
+  signal:
+    unhealthy_host_ratio: ">25% for 5m"   # ELBv2 UnHealthyHostCount / (Healthy+UnHealthy)
+    min_healthy_hosts: 1                   # never act if it would drop below this
+
+min_confidence: 0.95
+
+allowed_actions:
+  - scale_out_asg                          # reversible: +1 desired capacity
+  - set_asg_instance_unhealthy             # replace: ASG relaunches (human-gated)
+  - escalate
+
+approval:
+  # Auto only for the reversible scale-out, and only within these limits.
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: [scale_out_asg]  # replacement is excluded -> falls to human
+    require_reversible: true
+
+verify:
+  window: 10m
+  checks:
+    - { metric: alb_unhealthy_host_count, condition: "==0 for 5m" }
+    - { metric: alb_healthy_host_count,   condition: ">=desired_capacity" }
+    - { metric: alb_5xx_rate,             condition: "<0.5% for 5m" }
+
+rollback_if_failed: true                   # scale back in if recovery not observed
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

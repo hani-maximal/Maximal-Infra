@@ -1,0 +1,53 @@
+# Remediation contract — Lightsail instance failing load-balancer health checks.
+#
+# STATUS: post-MVP. Requires:
+#   - add `lightsail_instance_unhealthy` to IncidentType enum
+#   - detector: Lightsail GetLoadBalancer instance health + CPUUtilization / burst capacity
+#   - actions: reboot_lightsail_instance (NOT reversible), detach_from_lightsail_lb (reversible)
+#
+# DESIGN NOTE: a reboot cannot be reverted, so it is human-gated. The reversible mitigation is
+# to detach the unhealthy instance from the load balancer (re-attach to revert), which removes
+# it from rotation without destroying anything — eligible for bounded autonomy if at least
+# min_healthy_instances remain in the pool.
+
+incident_type: lightsail_instance_unhealthy
+
+source: [aws_devops_agent, self_detect]
+
+detect:
+  service: blog
+  load_balancer_name: blog-lb
+  signal:
+    instance_health: unhealthy               # LB health check failing
+    duration: ">5m"
+    min_healthy_instances: 1                  # never detach below this
+
+min_confidence: 0.95
+
+allowed_actions:
+  - detach_from_lightsail_lb                  # reversible: remove from rotation (re-attach to undo)
+  - reboot_lightsail_instance                 # human only (not reversible)
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [production]
+    allowed_action_types: [detach_from_lightsail_lb]   # reboot excluded -> human
+    require_reversible: true
+
+verify:
+  window: 10m
+  checks:
+    - { metric: lightsail_lb_healthy_count,   condition: ">=min_healthy_instances for 5m" }
+    - { metric: lightsail_lb_unhealthy_count, condition: "==0 for 5m" }
+
+rollback_if_failed: true                      # re-attach the instance; escalate
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

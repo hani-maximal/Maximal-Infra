@@ -1,0 +1,58 @@
+# Remediation contract — ECS tasks cannot be placed because capacity, subnet IPs, or service quotas are exhausted.
+#
+# STATUS: post-MVP. Requires:
+#   - add `ecs_task_placement_capacity_failed` to IncidentType enum
+#   - detector: ECS service events containing RESOURCE:CPU/MEMORY/ENI/PORTS, pendingTaskCount, capacity provider metrics
+#   - actions: scale_out_asg (reversible), open_fix_as_code_pr, escalate
+#
+# DESIGN NOTE: Placement failures are frequent during traffic spikes and bad capacity planning. For EC2
+# capacity providers, adding one ASG instance is reversible. For Fargate ENI/IP/quota failures, Maximal
+# should recommend/request capacity changes but not silently mutate VPC or quota configuration.
+
+incident_type: ecs_task_placement_capacity_failed
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: payments-api
+  cluster: prod-ecs
+  signal:
+    pending_tasks: ">0 for 5m"
+    service_event_patterns:
+      - "RESOURCE:CPU"
+      - "RESOURCE:MEMORY"
+      - "RESOURCE:ENI"
+      - "RESOURCE:PORTS"
+      - "unable to place a task"
+    capacity_provider_headroom: "<10%"
+
+min_confidence: 0.95
+
+allowed_actions:
+  - scale_out_asg                            # only for ECS-on-EC2 capacity provider, reversible by scale-in
+  - open_fix_as_code_pr                      # durable fix: desired capacity, subnets, task sizing, quotas
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: [scale_out_asg]
+    require_reversible: true
+
+verify:
+  window: 15m
+  checks:
+    - { metric: ecs_pending_task_count, condition: "==0 for 5m" }
+    - { metric: ecs_running_task_count, condition: "==desired_count for 5m" }
+    - { metric: service_steady_state,   condition: "reached" }
+
+rollback_if_failed: true                    # scale ASG back to snapshotted desired capacity if no recovery
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

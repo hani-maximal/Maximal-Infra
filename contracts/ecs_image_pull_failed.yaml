@@ -1,0 +1,57 @@
+# Remediation contract — ECS task launch fails because the container image cannot be pulled.
+#
+# STATUS: MVP-adjacent. Requires:
+#   - add `ecs_image_pull_failed` to IncidentType enum
+#   - detector: ECS stopped tasks/service events with CannotPullContainerError, ECR 403/404, image digest missing
+#   - actions: rollback_ecs_task_definition (reversible), open_fix_as_code_pr
+#
+# DESIGN NOTE: Image pull failures are usually bad deploy artifacts, wrong image tags/digests, ECR auth/IAM,
+# or transient registry/network problems. The safe production action is rollback to the last pullable task
+# definition. IAM/ECR policy fixes should be PR/human-reviewed, not ad-hoc production edits.
+
+incident_type: ecs_image_pull_failed
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: catalog-api
+  cluster: prod-fargate
+  signal:
+    stopped_reason_patterns:
+      - "CannotPullContainerError"
+      - "pull access denied"
+      - "manifest unknown"
+      - "no basic auth credentials"
+    failed_task_launches: ">=2 in 10m"
+    deploy_window: "within 60m"
+
+min_confidence: 0.95
+
+allowed_actions:
+  - rollback_ecs_task_definition             # restore last known-good image/task definition
+  - open_fix_as_code_pr                      # durable fix: image tag/digest/IAM/ECR policy
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: [rollback_ecs_task_definition]
+    require_reversible: true
+
+verify:
+  window: 10m
+  checks:
+    - { metric: ecs_task_launch_failures, condition: "==0 for 5m" }
+    - { metric: ecs_running_task_count,   condition: "==desired_count for 5m" }
+    - { metric: service_steady_state,     condition: "reached" }
+
+rollback_if_failed: true
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

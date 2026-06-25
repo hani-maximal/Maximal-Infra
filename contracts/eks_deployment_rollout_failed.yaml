@@ -1,0 +1,56 @@
+# Remediation contract — EKS Deployment rollout failed (new revision won't become ready).
+#
+# STATUS: post-MVP (Kubernetes/EKS is a fast-follow, not MVP). Requires:
+#   - add `eks_deployment_rollout_failed` to IncidentType enum
+#   - detector: Container Insights + K8s API (Deployment progress deadline exceeded,
+#     availableReplicas < desired, new ReplicaSet not ready, readiness probes failing)
+#   - action: rollback_k8s_deployment  (equivalent of `kubectl rollout undo`)
+#
+# DESIGN NOTE: Kubernetes rollout history makes this the cleanest reversible action in the
+# whole library — undoing to the previous revision restores the exact prior ReplicaSet.
+# Scope is a single Deployment in a single namespace. The K8s action runs through a scoped
+# IAM/RBAC identity (EKS access entry), never a cluster-admin credential.
+
+incident_type: eks_deployment_rollout_failed
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: orders-svc
+  cluster: prod-eks
+  namespace: orders
+  deployment: orders-svc
+  signal:
+    progress_deadline_exceeded: true        # rollout stuck
+    available_replicas_below_desired: ">0 for 5m"
+    deploy_window: "within 30m"
+
+min_confidence: 0.95
+
+allowed_actions:
+  - rollback_k8s_deployment                 # reversible: undo to previous revision
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1                # one Deployment
+    environments: [staging, production]
+    allowed_action_types: [rollback_k8s_deployment]
+    require_reversible: true
+
+verify:
+  window: 10m
+  checks:
+    - { metric: k8s_rollout_status,        condition: "complete" }
+    - { metric: k8s_available_replicas,    condition: "==desired_replicas for 5m" }
+    - { metric: k8s_pods_crashloop_count,  condition: "==0" }
+
+rollback_if_failed: true                    # re-undo / hold at previous revision; escalate
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

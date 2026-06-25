@@ -1,0 +1,54 @@
+# Remediation contract — ElastiCache/Redis memory pressure causing evictions or cache saturation.
+#
+# STATUS: post-MVP / diagnostic-first. Requires:
+#   - add `elasticache_memory_pressure_evictions` to IncidentType enum
+#   - detector: ElastiCache CloudWatch memory/eviction metrics + app error/latency correlation
+#   - actions: open_fix_as_code_pr, escalate
+#
+# DESIGN NOTE: The user's "cache memory capping" intuition is valid, but dangerous to auto-fix.
+# Flushing keys, changing eviction policy, or resizing nodes can change application semantics and cost.
+# Destructive cache operations are explicitly out of scope; this playbook should diagnose, prove impact,
+# draft a scaling/config PR, and escalate for human approval.
+
+incident_type: elasticache_memory_pressure_evictions
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: session-cache
+  replication_group_id: session-cache-prod
+  signal:
+    database_memory_usage_percentage: ">90% for 10m"
+    evictions: ">0 for 5m"
+    cache_hit_rate_drop: ">20% from baseline for 10m"
+    app_latency_correlation: true
+
+min_confidence: 0.95
+
+allowed_actions:
+  - open_fix_as_code_pr                      # durable fix: node size/shards/maxmemory policy/TTL hygiene
+  - escalate
+
+approval:
+  mode: always_human
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: []                 # no autonomous cache mutation
+    require_reversible: true
+
+verify:
+  window: 20m
+  checks:
+    - { metric: elasticache_evictions,                 condition: "==0 for 10m" }
+    - { metric: database_memory_usage_percentage,      condition: "<85% for 10m" }
+    - { metric: app_p95_latency,                       condition: "back_to_baseline" }
+
+rollback_if_failed: false
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

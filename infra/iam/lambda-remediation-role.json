@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadFunctionHistory",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:GetAlias",
+        "lambda:GetFunction",
+        "lambda:ListVersionsByFunction"
+      ],
+      "Resource": "${LAMBDA_FUNCTION_ARN}"
+    },
+    {
+      "Sid": "UpdateOneAlias",
+      "Effect": "Allow",
+      "Action": "lambda:UpdateAlias",
+      "Resource": "${LAMBDA_ALIAS_ARN}"
+    }
+  ]
+}

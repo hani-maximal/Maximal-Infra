@@ -1,0 +1,30 @@
+incident_type: ecs_service_unhealthy
+source: [aws_devops_agent, datadog, pagerduty, self_detect]
+detect:
+  service: checkout-api
+  signal:
+    running_below_desired: true
+    crash_loop: ">=3 in 10m"
+min_confidence: 0.95
+allowed_actions:
+  - rollback_ecs_task_definition
+  - force_new_ecs_deployment
+  - escalate
+approval:
+  mode: always_human
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: []
+    require_reversible: true
+verify:
+  window: 10m
+  checks:
+    - { metric: ecs_running_task_count, condition: "==desired_count for 5m" }
+    - { metric: service_steady_state, condition: "reached" }
+rollback_if_failed: true
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+notify:
+  slack_channel: "#prod-incidents"

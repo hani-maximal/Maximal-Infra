@@ -1,0 +1,55 @@
+# Remediation contract — EKS worker node NotReady / under resource pressure.
+#
+# STATUS: post-MVP. Requires:
+#   - add `eks_node_not_ready` to IncidentType enum
+#   - detector: Container Insights node_status_condition_ready / cluster_failed_node_count,
+#     or K8s API node conditions (NotReady, MemoryPressure, DiskPressure)
+#   - action: cordon_drain_replace_node  (DISRUPTIVE, NOT reversible)
+#
+# DESIGN NOTE: draining a node evicts running pods and the managed node group launches a
+# replacement — this is disruptive and cannot be reverted, so it is ALWAYS human-approved.
+# A reversible mitigation (scale the node group / cluster-autoscaler add capacity) is offered
+# first so a human can relieve pressure without evicting anything.
+
+incident_type: eks_node_not_ready
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: prod-eks
+  cluster: prod-eks
+  signal:
+    node_not_ready: ">=1 node for 5m"       # node Ready condition == False
+    node_pressure: [MemoryPressure, DiskPressure]
+    min_ready_nodes: 2                       # never drain below this
+
+min_confidence: 0.95
+
+allowed_actions:
+  - scale_node_group                         # reversible-ish: add capacity, relieve pressure
+  - cordon_drain_replace_node                # disruptive replacement (human only)
+  - escalate
+
+approval:
+  mode: always_human                         # node eviction is never autonomous
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: []                 # nothing auto-eligible
+    require_reversible: true
+
+verify:
+  window: 15m
+  checks:
+    - { metric: k8s_nodes_not_ready,   condition: "==0 for 5m" }
+    - { metric: k8s_pending_pods,      condition: "==0 for 5m" }
+    - { metric: cluster_failed_nodes,  condition: "==0" }
+
+rollback_if_failed: false                    # cannot un-drain; escalate (page) on failure
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

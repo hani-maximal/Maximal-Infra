@@ -1,0 +1,57 @@
+# Remediation contract — EC2/EBS disk full or inode exhaustion causing service failure.
+#
+# STATUS: post-MVP. Requires:
+#   - add `ec2_disk_full` to IncidentType enum
+#   - detector: CloudWatch Agent disk_used_percent/inodes_used_percent + ALB target health/app logs
+#   - actions: detach_unhealthy_target (reversible), extend_ebs_volume (human only), open_fix_as_code_pr
+#
+# DESIGN NOTE: Disk full is common on instance-backed services. Deleting files is destructive and arbitrary
+# shell cleanup is not allowed. The reversible mitigation is removing an unhealthy target from rotation;
+# increasing an EBS volume is usually safe but one-way, so it stays human-approved.
+
+incident_type: ec2_disk_full
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: legacy-worker
+  instance_tag: Service=legacy-worker
+  signal:
+    disk_used_percent: ">95% for 5m"
+    inodes_used_percent: ">95% for 5m"
+    app_log_patterns:
+      - "No space left on device"
+      - "ENOSPC"
+    target_health: "unhealthy optional"
+
+min_confidence: 0.95
+
+allowed_actions:
+  - detach_unhealthy_target                  # reversible if behind ALB and min healthy targets remain
+  - extend_ebs_volume                        # human-only; snapshot current volume size first
+  - open_fix_as_code_pr                      # durable fix: log rotation, volume size, retention
+  - escalate
+
+approval:
+  mode: always_human
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: []                 # start human-only; promote detach later per service
+    require_reversible: true
+
+verify:
+  window: 15m
+  checks:
+    - { metric: disk_used_percent,      condition: "<85% for 5m" }
+    - { metric: app_enospc_errors,      condition: "==0 for 5m" }
+    - { metric: target_health,          condition: "healthy or detached_safely" }
+
+rollback_if_failed: true                    # re-attach target if detach did not improve service health
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

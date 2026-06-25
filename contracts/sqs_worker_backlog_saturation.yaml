@@ -1,0 +1,55 @@
+# Remediation contract — SQS queue backlog / worker saturation breaching latency SLO.
+#
+# STATUS: post-MVP / good bounded-autonomy candidate. Requires:
+#   - add `sqs_worker_backlog_saturation` to IncidentType enum
+#   - detector: SQS ApproximateAgeOfOldestMessage + visible messages + worker ECS desired/running count
+#   - actions: scale_ecs_service (reversible), open_fix_as_code_pr
+#
+# DESIGN NOTE: Backlog saturation is frequent, easy to detect, and often safely mitigated by temporarily
+# scaling workers, provided downstream dependencies are healthy and the scale-up stays within contract limits.
+
+incident_type: sqs_worker_backlog_saturation
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: email-worker
+  queue_name: email-jobs-prod
+  worker_cluster: prod-fargate
+  worker_service: email-worker
+  signal:
+    approximate_age_of_oldest_message: ">300s for 5m"
+    visible_messages: ">1000 for 5m"
+    worker_running_below_desired: false
+    downstream_error_rate: "<1%"
+
+min_confidence: 0.95
+
+allowed_actions:
+  - scale_ecs_service                        # reversible desired-count increase with snapshotted prior count
+  - open_fix_as_code_pr                      # durable fix: autoscaling target, batch size, concurrency
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: [scale_ecs_service]
+    require_reversible: true
+
+verify:
+  window: 20m
+  checks:
+    - { metric: sqs_approximate_age_of_oldest_message, condition: "<120s for 10m" }
+    - { metric: sqs_visible_messages,                  condition: "decreasing for 10m" }
+    - { metric: downstream_error_rate,                 condition: "<1% for 10m" }
+
+rollback_if_failed: true                    # return desired count to snapshot if downstream health worsens or backlog not improving
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

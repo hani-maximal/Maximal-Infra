@@ -1,0 +1,31 @@
+incident_type: lambda_error_spike
+source: [aws_devops_agent, datadog, pagerduty, self_detect]
+detect:
+  service: billing-handler
+  function_name: billing-handler
+  signal:
+    error_rate: ">2% for 5m"
+    deploy_window: "within 30m"
+min_confidence: 0.95
+allowed_actions:
+  - rollback_lambda_alias
+  - open_fix_as_code_pr
+  - escalate
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: [rollback_lambda_alias]
+    require_reversible: true
+verify:
+  window: 10m
+  checks:
+    - { metric: lambda_error_rate, condition: "<1% for 5m" }
+    - { metric: lambda_throttles, condition: "==0 for 5m" }
+rollback_if_failed: true
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+notify:
+  slack_channel: "#prod-incidents"

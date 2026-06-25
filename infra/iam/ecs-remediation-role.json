@@ -1,0 +1,21 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DescribeScopedService",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeServices",
+        "ecs:DescribeTaskDefinition",
+        "ecs:ListTaskDefinitions"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "UpdateOneService",
+      "Effect": "Allow",
+      "Action": "ecs:UpdateService",
+      "Resource": "${ECS_SERVICE_ARN}"
+    }
+  ]
+}

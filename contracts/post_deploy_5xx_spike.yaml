@@ -1,0 +1,30 @@
+incident_type: post_deploy_5xx_spike
+source: [aws_devops_agent, datadog, self_detect]
+detect:
+  service: auth-api
+  signal:
+    alb_5xx_rate: ">2% for 5m"
+    deploy_window: "within 30m"
+min_confidence: 0.95
+allowed_actions:
+  - rollback_ecs_task_definition
+  - open_fix_as_code_pr
+  - escalate
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: [rollback_ecs_task_definition]
+    require_reversible: true
+verify:
+  window: 10m
+  checks:
+    - { metric: alb_5xx_rate, condition: "<0.5% for 10m" }
+    - { metric: p95_latency, condition: "<500ms" }
+rollback_if_failed: true
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+notify:
+  slack_channel: "#prod-incidents"

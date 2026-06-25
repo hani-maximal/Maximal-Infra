@@ -1,0 +1,56 @@
+# Remediation contract — RDS/database connection saturation causing app failures.
+#
+# STATUS: post-MVP / diagnostic-first. Requires:
+#   - add `rds_connection_saturation` to IncidentType enum
+#   - detector: RDS DatabaseConnections near max + app connection timeout logs + ALB 5xx correlation
+#   - actions: open_fix_as_code_pr, scale_ecs_service_down (human only), escalate
+#
+# DESIGN NOTE: Database repair/schema changes are out of scope, and DB failover/resize is not reversible.
+# The useful product behavior is fast diagnosis plus a reviewed fix PR for pool limits/backpressure, or a
+# human-approved temporary traffic/worker reduction when overload is actively harming production.
+
+incident_type: rds_connection_saturation
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: api-db
+  db_instance_identifier: app-prod
+  signal:
+    database_connections: ">90% of max_connections for 5m"
+    app_log_patterns:
+      - "too many connections"
+      - "connection pool exhausted"
+      - "remaining connection slots are reserved"
+    alb_5xx_rate: ">1% for 5m"
+
+min_confidence: 0.95
+
+allowed_actions:
+  - scale_ecs_service_down                   # human-only load shedding; snapshot desired count for revert
+  - open_fix_as_code_pr                      # durable fix: pool limits, pgbouncer/RDS Proxy, backpressure
+  - escalate
+
+approval:
+  mode: always_human
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: []
+    require_reversible: true
+
+verify:
+  window: 15m
+  checks:
+    - { metric: rds_database_connections, condition: "<80% of max_connections for 5m" }
+    - { metric: app_db_connection_errors, condition: "==0 for 5m" }
+    - { metric: alb_5xx_rate,             condition: "<0.5% for 5m" }
+
+rollback_if_failed: true                    # revert load-shedding desired count if it did not help
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

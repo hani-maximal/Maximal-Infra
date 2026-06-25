@@ -1,0 +1,55 @@
+# Remediation contract — downstream dependency 5xx/timeout spike causing service degradation.
+#
+# STATUS: post-MVP / diagnostic-first. Requires:
+#   - add `dependency_5xx_timeout_spike` to IncidentType enum
+#   - detector: app logs/traces showing dependency timeout/5xx + local service health + no deploy or deploy optional
+#   - actions: rollback_ecs_task_definition (if deploy introduced dependency path), disable_feature_flag (provider-specific), open_fix_as_code_pr, escalate
+#
+# DESIGN NOTE: Dependency outages are frequent, but safe remediation is highly application-specific.
+# This should start as a high-confidence diagnosis/escalation playbook. Autonomous action is only possible
+# when the customer pre-defines a reversible feature flag or traffic-shift contract for the dependency.
+
+incident_type: dependency_5xx_timeout_spike
+
+source: [aws_devops_agent, datadog, pagerduty, self_detect]
+
+detect:
+  service: checkout-api
+  dependency: payment-provider
+  signal:
+    dependency_error_rate: ">5% for 5m"
+    dependency_timeout_rate: ">2% for 5m"
+    local_cpu_memory_normal: true
+    local_deploy_window: "optional within 60m"
+
+min_confidence: 0.95
+
+allowed_actions:
+  - rollback_ecs_task_definition             # if a recent deploy caused the dependency regression
+  - disable_feature_flag                     # only if provider + flag are explicitly configured per service
+  - open_fix_as_code_pr
+  - escalate
+
+approval:
+  mode: always_human                         # promote only with customer-defined flag/traffic contracts
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: []
+    require_reversible: true
+
+verify:
+  window: 15m
+  checks:
+    - { metric: dependency_error_rate, condition: "<1% for 10m" }
+    - { metric: dependency_timeout_rate, condition: "<0.5% for 10m" }
+    - { metric: checkout_success_rate,  condition: "back_to_baseline" }
+
+rollback_if_failed: true
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

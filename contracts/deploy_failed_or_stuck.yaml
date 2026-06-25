@@ -1,0 +1,30 @@
+incident_type: deploy_failed_or_stuck
+source: [aws_devops_agent, datadog, pagerduty, self_detect]
+detect:
+  service: deploy-api
+  signal:
+    rollout_state: [FAILED, IN_PROGRESS_TIMEOUT]
+min_confidence: 0.95
+allowed_actions:
+  - rollback_ecs_task_definition
+  - force_new_ecs_deployment
+  - rerun_failed_deployment
+  - escalate
+approval:
+  mode: always_human
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    allowed_action_types: []
+    require_reversible: true
+verify:
+  window: 10m
+  checks:
+    - { metric: deployment_rollout_state, condition: "COMPLETED" }
+    - { metric: service_steady_state, condition: "reached" }
+rollback_if_failed: true
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+notify:
+  slack_channel: "#prod-incidents"
