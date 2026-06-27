@@ -28,6 +28,7 @@ export const incidentTypes = [
   "ec2_asg_unhealthy_hosts",
   "ec2_disk_full",
   "ec2_instance_status_check_failed",
+  "ec2_post_deploy_regression",
   "ecs_image_pull_failed",
   "ecs_task_placement_capacity_failed",
   "eks_deployment_rollout_failed",
@@ -97,7 +98,9 @@ export const IncidentSchema = z.object({
   deployCorrelation: z.object({
     deployId: z.string().min(1),
     deployedAt: z.string().datetime(),
-    artifactRef: z.string().min(1)
+    artifactRef: z.string().min(1),
+    gitCommitSha: z.string().regex(/^[0-9a-f]{40}$/).optional(),
+    gitRepo: z.string().regex(/^[\w.-]+\/[\w.-]+$/).optional(),
   }).nullable(),
   state: IncidentStateSchema,
   createdAt: z.string().datetime()
@@ -185,6 +188,7 @@ export interface ServiceContext {
     ecs?: { cluster: string; service: string };
     lambda?: { functionName: string; alias: string };
     ec2?: { instanceId: string; region: string };
+    git?: { repo: string; baseBranch: string };
   };
 }
 

@@ -169,11 +169,70 @@ export class Orchestrator {
         case "rds_connection_saturation":
           return [{ actionType: "scale_ecs_service_down", params: { desiredCount: 1, reason: "connection_saturation" } }];
 
+        case "ec2_post_deploy_regression": {
+          const gitSha = incident.deployCorrelation?.gitCommitSha;
+          const gitRepo = incident.deployCorrelation?.gitRepo ?? context.resources.git?.repo;
+          if (gitSha && gitRepo) {
+            return [
+              {
+                actionType: "open_revert_pr",
+                params: {
+                  repo: gitRepo,
+                  commitSha: gitSha,
+                  baseBranch: context.resources.git?.baseBranch ?? "main",
+                  incidentSummary:
+                    incident.evidence[0]?.summary ??
+                    `EC2 service outage on ${incident.service} following deploy ${incident.deployCorrelation?.deployId ?? "unknown"}`,
+                },
+              },
+              {
+                actionType: "restart_ec2_instance",
+                params: {
+                  instanceId: context.resources.ec2?.instanceId ?? "",
+                  region: context.resources.ec2?.region ?? "us-east-1",
+                },
+              },
+            ];
+          }
+          return [
+            {
+              actionType: "restart_ec2_instance",
+              params: {
+                instanceId: context.resources.ec2?.instanceId ?? "",
+                region: context.resources.ec2?.region ?? "us-east-1",
+              },
+            },
+          ];
+        }
+
         default:
           if (incident.type.startsWith("lambda_")) {
             return [{ actionType: "rollback_lambda_alias", params: { previousVersion: "41" } }];
           }
           if (incident.type.startsWith("ec2_")) {
+            // If the incident carries a git commit SHA, prefer the revert PR path over a bare restart
+            const gitSha = incident.deployCorrelation?.gitCommitSha;
+            const gitRepo = incident.deployCorrelation?.gitRepo ?? context.resources.git?.repo;
+            if (gitSha && gitRepo) {
+              return [
+                {
+                  actionType: "open_revert_pr",
+                  params: {
+                    repo: gitRepo,
+                    commitSha: gitSha,
+                    baseBranch: context.resources.git?.baseBranch ?? "main",
+                    incidentSummary: incident.evidence[0]?.summary ?? `EC2 service outage on ${incident.service}`,
+                  },
+                },
+                {
+                  actionType: "restart_ec2_instance",
+                  params: {
+                    instanceId: context.resources.ec2?.instanceId ?? "",
+                    region: context.resources.ec2?.region ?? "us-east-1",
+                  },
+                },
+              ];
+            }
             return [
               {
                 actionType: "restart_ec2_instance",
@@ -192,7 +251,8 @@ export class Orchestrator {
 
     return (
       candidates.find(({ actionType }) =>
-        contract.allowed_actions.includes(actionType)
+        contract.allowed_actions.includes(actionType) &&
+        this.actions.get(actionType) !== null
       ) ?? null
     );
   }

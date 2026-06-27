@@ -52,12 +52,25 @@ export interface GitHubPrState {
   repo: string;
 }
 
+export interface GitHubCommitState {
+  sha: string;
+  message: string;
+  treeSha: string;
+  parentSha: string;
+}
+
 export interface GitHubAdapterInterface {
   getFileContent(repo: string, filePath: string, ref: string): Promise<GitHubFileState>;
   createBranch(repo: string, branchName: string, fromSha: string): Promise<void>;
   commitFile(repo: string, filePath: string, content: string, message: string, branch: string, existingSha: string): Promise<void>;
   createPr(repo: string, title: string, body: string, head: string, base: string): Promise<GitHubPrState>;
   closePr(repo: string, pullNumber: number): Promise<void>;
+  // Git revert support
+  getBranchHead(repo: string, branch: string): Promise<{ sha: string }>;
+  getCommit(repo: string, sha: string): Promise<GitHubCommitState>;
+  createCommit(repo: string, opts: { message: string; treeSha: string; parentShas: string[] }): Promise<{ sha: string }>;
+  createRef(repo: string, refName: string, sha: string): Promise<void>;
+  findPullRequestByBranch(repo: string, headBranch: string): Promise<number | null>;
 }
 
 async function ghFetch(path: string, init: RequestInit): Promise<Response> {
@@ -120,6 +133,54 @@ export class GitHubAdapter implements GitHubAdapterInterface {
     });
     if (!res.ok) throw new Error(`GitHub close PR failed: ${res.status} #${pullNumber}`);
   }
+
+  async getBranchHead(repo: string, branch: string): Promise<{ sha: string }> {
+    const res = await ghFetch(`/repos/${repo}/git/refs/heads/${encodeURIComponent(branch)}`, { method: "GET" });
+    if (!res.ok) throw new Error(`GitHub get branch head failed: ${res.status} ${repo}@${branch}`);
+    const data = await res.json() as { object: { sha: string } };
+    return { sha: data.object.sha };
+  }
+
+  async getCommit(repo: string, sha: string): Promise<GitHubCommitState> {
+    const res = await ghFetch(`/repos/${repo}/commits/${encodeURIComponent(sha)}`, { method: "GET" });
+    if (!res.ok) throw new Error(`GitHub get commit failed: ${res.status} ${sha}`);
+    const data = await res.json() as {
+      sha: string;
+      commit: { message: string; tree: { sha: string }; parents: Array<{ sha: string }> };
+    };
+    const parentSha = data.commit.parents[0]?.sha;
+    if (!parentSha) throw new Error(`Commit ${sha} has no parent — cannot revert a root commit`);
+    return { sha: data.sha, message: data.commit.message, treeSha: data.commit.tree.sha, parentSha };
+  }
+
+  async createCommit(repo: string, opts: { message: string; treeSha: string; parentShas: string[] }): Promise<{ sha: string }> {
+    const res = await ghFetch(`/repos/${repo}/git/commits`, {
+      method: "POST",
+      body: JSON.stringify({ message: opts.message, tree: opts.treeSha, parents: opts.parentShas }),
+    });
+    if (!res.ok) throw new Error(`GitHub create commit failed: ${res.status}`);
+    const data = await res.json() as { sha: string };
+    return { sha: data.sha };
+  }
+
+  async createRef(repo: string, refName: string, sha: string): Promise<void> {
+    const res = await ghFetch(`/repos/${repo}/git/refs`, {
+      method: "POST",
+      body: JSON.stringify({ ref: refName, sha }),
+    });
+    if (!res.ok) throw new Error(`GitHub create ref failed: ${res.status} ${refName}`);
+  }
+
+  async findPullRequestByBranch(repo: string, headBranch: string): Promise<number | null> {
+    const [owner] = repo.split("/");
+    const res = await ghFetch(
+      `/repos/${repo}/pulls?head=${encodeURIComponent(`${owner}:${headBranch}`)}&state=open&per_page=1`,
+      { method: "GET" }
+    );
+    if (!res.ok) return null;
+    const data = await res.json() as Array<{ number: number }>;
+    return data[0]?.number ?? null;
+  }
 }
 
 // Null adapter for environments without GitHub credentials (dry-run / tests)
@@ -129,10 +190,24 @@ export class NullGitHubAdapter implements GitHubAdapterInterface {
   }
   async createBranch(): Promise<void> {}
   async commitFile(): Promise<void> {}
-  async createPr(repo: string, _title: string, _body: string, head: string, base: string): Promise<GitHubPrState> {
+  async createPr(repo: string, _title: string, _body: string, _head: string, _base: string): Promise<GitHubPrState> {
     return { pullNumber: 0, repo };
   }
   async closePr(): Promise<void> {}
+  async getBranchHead(_repo: string, _branch: string): Promise<{ sha: string }> {
+    return { sha: "0000000000000000000000000000000000000000" };
+  }
+  async getCommit(_repo: string, sha: string): Promise<GitHubCommitState> {
+    const zero = "0000000000000000000000000000000000000000";
+    return { sha, message: "placeholder commit", treeSha: zero, parentSha: zero };
+  }
+  async createCommit(): Promise<{ sha: string }> {
+    return { sha: "0000000000000000000000000000000000000000" };
+  }
+  async createRef(): Promise<void> {}
+  async findPullRequestByBranch(): Promise<number | null> {
+    return null;
+  }
 }
 
 export function getGitHubAdapter(): GitHubAdapterInterface | null {

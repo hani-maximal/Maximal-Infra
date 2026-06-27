@@ -1,0 +1,43 @@
+incident_type: ec2_post_deploy_regression
+
+source: [aws_devops_agent, datadog, self_detect]
+
+detect:
+  service: api-server
+  signal:
+    http_health_probe: "failing for 3 consecutive checks"
+    deploy_window: "within 30m"
+    git_commit_sha: "present"   # detector must supply deployCorrelation.gitCommitSha
+
+min_confidence: 0.95
+
+allowed_actions:
+  - open_revert_pr
+  - restart_ec2_instance
+  - escalate
+
+approval:
+  mode: auto_under_blast_radius
+  blast_radius:
+    max_affected_services: 1
+    environments: [staging, production]
+    # open_revert_pr only opens a PR — the human still merges and triggers the deploy.
+    # restart_ec2_instance is kept human-only here; promote to allowed_action_types
+    # once you've validated the revert + restart combination for your service.
+    allowed_action_types: [open_revert_pr]
+    require_reversible: true
+
+verify:
+  window: 15m
+  checks:
+    - { metric: http_health_probe, condition: "healthy for 5m" }
+    - { metric: alb_5xx_rate,      condition: "<0.5% for 5m" }
+
+rollback_if_failed: true   # closes the revert PR if verification fails
+
+on_resolve:
+  draft_postmortem: true
+  learn_contract: true
+
+notify:
+  slack_channel: "#prod-incidents"

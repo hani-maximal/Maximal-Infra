@@ -1521,6 +1521,139 @@ export function createActionRegistry(adapter: AwsAdapterInterface, github?: GitH
       },
     };
     registry.register(openFixAsCodePr);
+
+  // ── Open revert PR ────────────────────────────────────────────────────────
+  // Creates a revert commit on a new branch and opens a PR against the base
+  // branch. Targets EC2 (and any instance-based) services where there is no
+  // AWS-native runtime rollback — the PR is the revert mechanism, and the
+  // team's existing CD pipeline handles the redeploy after merge.
+  //
+  // Safety constraint: only reverts the branch tip. If the bad commit is not
+  // the current HEAD of baseBranch (i.e. subsequent commits have landed),
+  // preconditions fail and the incident escalates — we cannot safely produce
+  // a conflict-free revert commit without human-assisted merge resolution.
+  const revertPrParams = z.object({
+    repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/, "must be owner/repo"),
+    commitSha: z.string().regex(/^[0-9a-f]{40}$/, "must be a full 40-char git SHA"),
+    baseBranch: z.string().min(1).default("main"),
+    incidentSummary: z.string().min(1).max(2_000),
+  });
+  const openRevertPr: RemediationAction<z.infer<typeof revertPrParams>> = {
+    type: "open_revert_pr",
+    isReversible: true,
+    parseParams: (input) => revertPrParams.parse(input),
+    blastRadius: (_params, context) => ({
+      affectedServices: [context.service],
+      environment: context.environment,
+      actionType: "open_revert_pr",
+    }),
+    preconditions: async (params, _context) => {
+      if (!params.repo) return { ok: false, reason: "missing_repo" };
+      if (!params.commitSha) return { ok: false, reason: "missing_commit_sha" };
+      const { sha: headSha } = await github.getBranchHead(params.repo, params.baseBranch);
+      // Null adapter returns all-zeros — skip the tip check in dry-run mode
+      if (headSha !== "0000000000000000000000000000000000000000" && headSha !== params.commitSha) {
+        return { ok: false, reason: "commit_is_not_branch_tip_cannot_safely_auto_revert" };
+      }
+      return { ok: true };
+    },
+    captureState: async (params, _context) => {
+      const { sha: headSha } = await github.getBranchHead(params.repo, params.baseBranch);
+      const badCommit = await github.getCommit(params.repo, params.commitSha);
+      const parentCommit = await github.getCommit(params.repo, badCommit.parentSha);
+      // Branch name is deterministic from SHA so revert() can find the open PR
+      const branchName = `maximal/revert-${params.commitSha.slice(0, 8)}`;
+      return {
+        id: randomUUID(),
+        actionType: "open_revert_pr",
+        resource: `github:${params.repo}@${params.baseBranch}`,
+        state: {
+          repo: params.repo,
+          baseBranch: params.baseBranch,
+          commitSha: params.commitSha,
+          commitMessage: badCommit.message,
+          parentTreeSha: parentCommit.treeSha,
+          headSha,
+          branchName,
+        },
+        capturedAt: new Date().toISOString(),
+      };
+    },
+    execute: async (params, context, snapshot) => {
+      const { repo, baseBranch, commitSha, commitMessage, parentTreeSha, headSha, branchName } =
+        snapshot.state as {
+          repo: string; baseBranch: string; commitSha: string; commitMessage: string;
+          parentTreeSha: string; headSha: string; branchName: string;
+        };
+
+      const firstLine = (commitMessage as string).split("\n")[0] ?? commitMessage;
+      const revertMessage = [
+        `Revert "${firstLine}"`,
+        "",
+        `This reverts commit ${commitSha}.`,
+        "",
+        `Auto-created by Maximal during incident response on ${context.service} (${context.environment}).`,
+        `Incident summary: ${params.incidentSummary.slice(0, 400)}`,
+      ].join("\n");
+
+      const { sha: revertSha } = await github.createCommit(repo, {
+        message: revertMessage,
+        treeSha: parentTreeSha,
+        parentShas: [headSha],
+      });
+
+      await github.createRef(repo, `refs/heads/${branchName}`, revertSha);
+
+      const pr = await github.createPr(
+        repo,
+        `revert(${context.service}): Revert breaking deploy — Maximal`,
+        [
+          `## Automated revert`,
+          ``,
+          `Maximal detected a service outage on \`${context.service}\` (${context.environment}) correlated with a recent deploy and opened this revert automatically.`,
+          ``,
+          `**Reverts commit:** \`${commitSha}\``,
+          `**Original message:** ${firstLine}`,
+          ``,
+          `**Incident summary:** ${params.incidentSummary.slice(0, 500)}`,
+          ``,
+          `> ⚠️ Review before merging. Merging will trigger your standard CI/CD deployment pipeline to redeploy \`${baseBranch}\` to production.`,
+        ].join("\n"),
+        branchName,
+        baseBranch,
+      );
+
+      return {
+        ok: true,
+        actionType: "open_revert_pr",
+        awsCalls: [],
+        snapshotId: snapshot.id,
+        message: `Revert PR #${pr.pullNumber} opened on ${repo}: ${branchName}`,
+      };
+    },
+    revert: async (snapshot, _context) => {
+      const { repo, branchName } = snapshot.state as { repo: string; branchName: string };
+      const pullNumber = await github.findPullRequestByBranch(repo, branchName);
+      if (pullNumber) {
+        await github.closePr(repo, pullNumber);
+        return {
+          ok: true,
+          actionType: "open_revert_pr",
+          awsCalls: [],
+          snapshotId: snapshot.id,
+          message: `Revert PR #${pullNumber} closed (remediation rolled back)`,
+        };
+      }
+      return {
+        ok: true,
+        actionType: "open_revert_pr",
+        awsCalls: [],
+        snapshotId: snapshot.id,
+        message: "No open revert PR found to close — may have already been merged or closed manually",
+      };
+    },
+  };
+    registry.register(openRevertPr);
   }
 
   return registry;
