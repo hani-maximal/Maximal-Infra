@@ -5,3 +5,15 @@ dist/
 coverage/
 *.log
 .maximal/
+
+# Next.js
+.next/
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# Tofu / Terraform — never commit live secrets or state
+infra/tofu/terraform.tfvars
+infra/tofu/.terraform/
+infra/tofu/.terraform.lock.hcl
+infra/tofu/terraform.tfstate
+infra/tofu/terraform.tfstate.backup

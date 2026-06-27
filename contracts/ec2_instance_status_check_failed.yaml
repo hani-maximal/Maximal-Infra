@@ -1,54 +1,26 @@
-# Remediation contract — EC2 instance/system status check failing (impaired instance).
-#
-# STATUS: post-MVP. Requires:
-#   - add `ec2_instance_status_check_failed` to IncidentType enum
-#   - detector: CloudWatch StatusCheckFailed_Instance / StatusCheckFailed_System
-#   - actions: reboot_ec2_instance (NOT reversible), set_asg_instance_unhealthy (NOT reversible)
-#
-# DESIGN NOTE: there is NO reversible action for an impaired single instance — a reboot
-# cannot be un-done and a replacement terminates the host. The whole contract is therefore
-# always_human. A system-status failure (AWS host problem) should prefer ASG replacement;
-# an instance-status failure (guest problem) may be fixed by a reboot. Maximal surfaces
-# both options with evidence and lets a human choose.
-
 incident_type: ec2_instance_status_check_failed
-
-source: [aws_devops_agent, datadog, self_detect]
-
+source: [self_detect]
 detect:
-  service: batch-runner
+  service: getmaximal.com
   signal:
-    status_check_failed: ">=1 for 5m"      # StatusCheckFailed (any) sustained
-    distinguish:
-      system: StatusCheckFailed_System     # AWS-side -> prefer replace
-      instance: StatusCheckFailed_Instance # guest-side -> reboot may help
-
-min_confidence: 0.95
-
+    http_reachable: "false for 3 consecutive checks"
+min_confidence: 0.90
 allowed_actions:
-  - reboot_ec2_instance                    # for instance-status failures
-  - set_asg_instance_unhealthy             # for system-status failures (if ASG-managed)
-  - escalate
-
+  - restart_ec2_instance
 approval:
-  mode: always_human                       # no reversible action -> never auto
+  mode: always_human
   blast_radius:
     max_affected_services: 1
-    environments: [staging, production]
-    allowed_action_types: []               # nothing auto-eligible
+    environments: [production, staging]
+    allowed_action_types: [restart_ec2_instance]
     require_reversible: true
-
 verify:
-  window: 10m
+  window: 5m
   checks:
-    - { metric: ec2_status_check_failed, condition: "==0 for 5m" }
-    - { metric: instance_reachability,   condition: "passed" }
-
-rollback_if_failed: false                  # reboot/replace cannot be reverted; escalate on fail
-
+    - { metric: http_status, condition: "200 for 5m" }
+rollback_if_failed: false
 on_resolve:
   draft_postmortem: true
-  learn_contract: true
-
+  learn_contract: false
 notify:
   slack_channel: "#prod-incidents"

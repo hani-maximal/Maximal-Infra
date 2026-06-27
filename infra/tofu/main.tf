@@ -13,6 +13,42 @@ locals {
     [for role in aws_iam_role.lambda_remediation : role.arn]
   )
   all_remediation_role_arns = concat(var.remediation_role_arns, local.created_remediation_role_arns)
+
+  task_environment = concat(
+    [
+      { name = "NODE_ENV",      value = "production" },
+      { name = "HOST",          value = "0.0.0.0" },
+      { name = "PORT",          value = tostring(var.container_port) },
+      { name = "MAXIMAL_MODE",  value = var.maximal_mode },
+      { name = "CONTRACTS_DIR", value = "contracts" },
+    ],
+    var.enable_database ? [
+      { name = "DB_OPS_DB", value = "maximal_ops" },
+      { name = "DB_APP_DB", value = "maximal_app" },
+    ] : [],
+    var.enable_contracts_bucket ? [
+      { name = "CONTRACTS_S3_BUCKET", value = aws_s3_bucket.contracts[0].id }
+    ] : [],
+    var.enable_redis ? [
+      { name = "REDIS_URL", value = "redis://${aws_elasticache_cluster.redis[0].cache_nodes[0].address}:6379" }
+    ] : []
+  )
+
+  task_secrets = var.enable_database ? [
+    { name = "DB_OPS_HOST",     valueFrom = "${aws_db_instance.ops[0].master_user_secret[0].secret_arn}:host::" },
+    { name = "DB_OPS_PORT",     valueFrom = "${aws_db_instance.ops[0].master_user_secret[0].secret_arn}:port::" },
+    { name = "DB_OPS_USER",     valueFrom = "${aws_db_instance.ops[0].master_user_secret[0].secret_arn}:username::" },
+    { name = "DB_OPS_PASSWORD", valueFrom = "${aws_db_instance.ops[0].master_user_secret[0].secret_arn}:password::" },
+    { name = "DB_APP_HOST",     valueFrom = "${aws_db_instance.app[0].master_user_secret[0].secret_arn}:host::" },
+    { name = "DB_APP_PORT",     valueFrom = "${aws_db_instance.app[0].master_user_secret[0].secret_arn}:port::" },
+    { name = "DB_APP_USER",     valueFrom = "${aws_db_instance.app[0].master_user_secret[0].secret_arn}:username::" },
+    { name = "DB_APP_PASSWORD", valueFrom = "${aws_db_instance.app[0].master_user_secret[0].secret_arn}:password::" },
+    { name = "JWT_SECRET",             valueFrom = "${aws_secretsmanager_secret.app_config[0].arn}:jwt_secret::" },
+    { name = "GITHUB_TOKEN",           valueFrom = "${aws_secretsmanager_secret.app_config[0].arn}:github_token::" },
+    { name = "GITHUB_APP_ID",          valueFrom = "${aws_secretsmanager_secret.app_config[0].arn}:github_app_id::" },
+    { name = "GITHUB_PRIVATE_KEY",     valueFrom = "${aws_secretsmanager_secret.app_config[0].arn}:github_private_key::" },
+    { name = "GITHUB_INSTALLATION_ID", valueFrom = "${aws_secretsmanager_secret.app_config[0].arn}:github_installation_id::" },
+  ] : []
 }
 
 resource "aws_vpc" "main" {
@@ -350,13 +386,8 @@ resource "aws_ecs_task_definition" "app" {
       appProtocol   = "http"
     }]
 
-    environment = [
-      { name = "NODE_ENV", value = "production" },
-      { name = "HOST", value = "0.0.0.0" },
-      { name = "PORT", value = tostring(var.container_port) },
-      { name = "MAXIMAL_MODE", value = var.maximal_mode },
-      { name = "CONTRACTS_DIR", value = "contracts" }
-    ]
+    environment = local.task_environment
+    secrets     = local.task_secrets
 
     readonlyRootFilesystem = true
 
@@ -471,10 +502,8 @@ resource "aws_ecs_service" "app" {
   propagate_tags          = "SERVICE"
   wait_for_steady_state   = true
 
-  # The current repository is in-memory. Avoid two concurrently serving tasks
-  # until incidents and audit records are persisted in PostgreSQL.
-  deployment_minimum_healthy_percent = 0
-  deployment_maximum_percent         = 100
+  deployment_minimum_healthy_percent = var.enable_database ? 100 : 0
+  deployment_maximum_percent         = var.enable_database ? 200 : 100
 
   deployment_circuit_breaker {
     enable   = true
@@ -512,4 +541,274 @@ resource "aws_route53_record" "app" {
     zone_id                = aws_lb.app.zone_id
     evaluate_target_health = true
   }
+}
+
+# ── Isolated subnets (RDS + Redis, no internet route) ────────────────────────
+
+resource "aws_subnet" "isolated" {
+  for_each = (var.enable_database || var.enable_redis) ? { for index, az in local.availability_zones : az => index } : {}
+
+  vpc_id            = aws_vpc.main.id
+  availability_zone = each.key
+  cidr_block        = cidrsubnet(var.vpc_cidr, 8, each.value + 10)
+
+  tags = {
+    Name = "${var.name}-isolated-${each.key}"
+    Tier = "isolated"
+  }
+}
+
+resource "aws_route_table" "isolated" {
+  count  = (var.enable_database || var.enable_redis) ? 1 : 0
+  vpc_id = aws_vpc.main.id
+  tags   = { Name = "${var.name}-isolated" }
+}
+
+resource "aws_route_table_association" "isolated" {
+  for_each = aws_subnet.isolated
+
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.isolated[0].id
+}
+
+# ── Security groups for RDS and Redis ────────────────────────────────────────
+
+resource "aws_security_group" "rds" {
+  count = var.enable_database ? 1 : 0
+
+  name_prefix = "${var.name}-rds-"
+  description = "PostgreSQL access for Maximal Fargate tasks"
+  vpc_id      = aws_vpc.main.id
+
+  egress {
+    description = "Allow outbound (required by AWS)"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  lifecycle { create_before_destroy = true }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "rds_from_task" {
+  count = var.enable_database ? 1 : 0
+
+  security_group_id            = aws_security_group.rds[0].id
+  referenced_security_group_id = aws_security_group.task.id
+  from_port                    = 5432
+  to_port                      = 5432
+  ip_protocol                  = "tcp"
+  description                  = "PostgreSQL from Fargate tasks"
+}
+
+resource "aws_security_group" "redis" {
+  count = var.enable_redis ? 1 : 0
+
+  name_prefix = "${var.name}-redis-"
+  description = "Redis access for Maximal Fargate tasks"
+  vpc_id      = aws_vpc.main.id
+
+  egress {
+    description = "Allow outbound (required by AWS)"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  lifecycle { create_before_destroy = true }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "redis_from_task" {
+  count = var.enable_redis ? 1 : 0
+
+  security_group_id            = aws_security_group.redis[0].id
+  referenced_security_group_id = aws_security_group.task.id
+  from_port                    = 6379
+  to_port                      = 6379
+  ip_protocol                  = "tcp"
+  description                  = "Redis from Fargate tasks"
+}
+
+# ── Subnet groups ─────────────────────────────────────────────────────────────
+
+resource "aws_db_subnet_group" "main" {
+  count = var.enable_database ? 1 : 0
+
+  name       = var.name
+  subnet_ids = [for subnet in aws_subnet.isolated : subnet.id]
+
+  tags = { Name = "${var.name}-db-subnet-group" }
+}
+
+resource "aws_elasticache_subnet_group" "main" {
+  count = var.enable_redis ? 1 : 0
+
+  name       = var.name
+  subnet_ids = [for subnet in aws_subnet.isolated : subnet.id]
+}
+
+# ── RDS PostgreSQL instances ──────────────────────────────────────────────────
+
+resource "aws_db_instance" "ops" {
+  count = var.enable_database ? 1 : 0
+
+  identifier        = "${var.name}-ops"
+  engine            = "postgres"
+  engine_version    = "16"
+  instance_class    = var.database_instance_class
+  allocated_storage = 20
+  storage_type      = "gp3"
+  storage_encrypted = true
+
+  db_name  = "maximal_ops"
+  username = "maximal_ops"
+  manage_master_user_password = true
+
+  db_subnet_group_name   = aws_db_subnet_group.main[0].name
+  vpc_security_group_ids = [aws_security_group.rds[0].id]
+  publicly_accessible    = false
+
+  backup_retention_period = 7
+  deletion_protection     = false
+  skip_final_snapshot     = true
+  multi_az                = false
+  apply_immediately       = true
+
+  tags = { Name = "${var.name}-ops" }
+}
+
+resource "aws_db_instance" "app" {
+  count = var.enable_database ? 1 : 0
+
+  identifier        = "${var.name}-app"
+  engine            = "postgres"
+  engine_version    = "16"
+  instance_class    = var.database_instance_class
+  allocated_storage = 20
+  storage_type      = "gp3"
+  storage_encrypted = true
+
+  db_name  = "maximal_app"
+  username = "maximal_app"
+  manage_master_user_password = true
+
+  db_subnet_group_name   = aws_db_subnet_group.main[0].name
+  vpc_security_group_ids = [aws_security_group.rds[0].id]
+  publicly_accessible    = false
+
+  backup_retention_period = 7
+  deletion_protection     = false
+  skip_final_snapshot     = true
+  multi_az                = false
+  apply_immediately       = true
+
+  tags = { Name = "${var.name}-app" }
+}
+
+# ── Secrets Manager ───────────────────────────────────────────────────────────
+# DB credentials are managed by RDS (manage_master_user_password = true).
+# app_config holds integration secrets written by infra/scripts/seed-secrets.sh.
+
+resource "aws_secretsmanager_secret" "app_config" {
+  count                   = var.enable_database ? 1 : 0
+  name                    = "${var.name}/app-config"
+  recovery_window_in_days = 0
+}
+
+# ── ElastiCache Redis ─────────────────────────────────────────────────────────
+
+resource "aws_elasticache_cluster" "redis" {
+  count = var.enable_redis ? 1 : 0
+
+  cluster_id      = var.name
+  engine          = "redis"
+  engine_version  = "7.1"
+  node_type       = var.redis_node_type
+  num_cache_nodes = 1
+  port            = 6379
+
+  subnet_group_name  = aws_elasticache_subnet_group.main[0].name
+  security_group_ids = [aws_security_group.redis[0].id]
+
+  apply_immediately = true
+}
+
+# ── S3 contracts bucket ───────────────────────────────────────────────────────
+
+resource "aws_s3_bucket" "contracts" {
+  count         = var.enable_contracts_bucket ? 1 : 0
+  bucket        = "${var.name}-contracts-${data.aws_caller_identity.current.account_id}"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket_versioning" "contracts" {
+  count  = var.enable_contracts_bucket ? 1 : 0
+  bucket = aws_s3_bucket.contracts[0].id
+
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_public_access_block" "contracts" {
+  count  = var.enable_contracts_bucket ? 1 : 0
+  bucket = aws_s3_bucket.contracts[0].id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# ── IAM: execution role reads secrets; task role reads/writes data ─────────────
+
+resource "aws_iam_role_policy" "execution_secrets" {
+  count = var.enable_database ? 1 : 0
+
+  name = "${var.name}-execution-secrets"
+  role = aws_iam_role.execution.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "ReadTaskSecrets"
+      Effect = "Allow"
+      Action = ["secretsmanager:GetSecretValue"]
+      Resource = [
+        aws_db_instance.ops[0].master_user_secret[0].secret_arn,
+        aws_db_instance.app[0].master_user_secret[0].secret_arn,
+        aws_secretsmanager_secret.app_config[0].arn,
+      ]
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "task_data" {
+  count = (var.enable_contracts_bucket || var.enable_database) ? 1 : 0
+
+  name = "${var.name}-task-data"
+  role = aws_iam_role.task.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(
+      var.enable_contracts_bucket ? [{
+        Sid    = "ContractsBucket"
+        Effect = "Allow"
+        Action = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"]
+        Resource = [
+          aws_s3_bucket.contracts[0].arn,
+          "${aws_s3_bucket.contracts[0].arn}/*",
+        ]
+      }] : [],
+      var.enable_database ? [{
+        Sid      = "ReadAppConfig"
+        Effect   = "Allow"
+        Action   = ["secretsmanager:GetSecretValue"]
+        Resource = [aws_secretsmanager_secret.app_config[0].arn]
+      }] : []
+    )
+  })
 }

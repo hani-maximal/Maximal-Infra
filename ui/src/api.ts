@@ -7,16 +7,12 @@ export class UnauthorizedError extends Error {
   }
 }
 
-let _token: string | null = null;
-
-export function setApiToken(token: string | null): void {
-  _token = token;
-}
-
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
-  const headers: Record<string, string> = { "content-type": "application/json" };
-  if (_token) headers["authorization"] = `Bearer ${_token}`;
-  const response = await fetch(url, { headers, ...init });
+  const response = await fetch(url, {
+    credentials: "include",
+    headers: { "content-type": "application/json" },
+    ...init
+  });
   if (response.status === 401) throw new UnauthorizedError();
   const body = (await response.json()) as T & { error?: string };
   if (!response.ok) throw new Error(body.error ?? "Request failed");
@@ -24,6 +20,8 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  me: () =>
+    request<{ userId: string; tenantId: string; authEnabled: boolean }>("/api/auth/me"),
   login: (username: string, password: string) =>
     request<{ token: string }>("/api/auth/login", {
       method: "POST",

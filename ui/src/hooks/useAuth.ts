@@ -1,19 +1,34 @@
-import { useState } from "react";
-
-const TOKEN_KEY = "maximal_token";
+import { useState, useEffect } from "react";
+import { api, UnauthorizedError } from "../api.js";
 
 export function useAuth() {
-  const [token, setToken] = useState<string | null>(() => localStorage.getItem(TOKEN_KEY));
+  // null = still checking session via /api/auth/me
+  // true = authenticated (cookie valid or auth disabled)
+  // false = not authenticated, show login
+  const [loggedIn, setLoggedIn] = useState<boolean | null>(null);
 
-  function login(newToken: string) {
-    localStorage.setItem(TOKEN_KEY, newToken);
-    setToken(newToken);
+  useEffect(() => {
+    api.me()
+      .then(() => setLoggedIn(true))
+      .catch((err) => {
+        // 401 = valid auth-enabled server, not logged in
+        // anything else (network, 5xx) = fail safe to login page
+        setLoggedIn(err instanceof UnauthorizedError ? false : false);
+      });
+  }, []);
+
+  function login() {
+    setLoggedIn(true);
   }
 
-  function logout() {
-    localStorage.removeItem(TOKEN_KEY);
-    setToken(null);
+  async function logout() {
+    try {
+      await api.logout();
+    } catch {
+      // Best-effort; clear local state regardless
+    }
+    setLoggedIn(false);
   }
 
-  return { token, login, logout };
+  return { loggedIn, login, logout };
 }

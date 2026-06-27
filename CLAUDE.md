@@ -29,5 +29,8 @@ TypeScript (strict) · Node 20+ · zod (load-bearing) · AWS SDK v3 · `@anthrop
 ## Repo map
 See `SPEC.md §5`. Start at `src/types/` (zod schemas), then `audit/`, then `contracts/`, then `executor/`, then the state machine.
 
+## Changelog discipline
+At the end of any session that changes the base behaviour of the app — new features, new modules, schema changes, new API endpoints, new safety gates, new env vars, or changes to existing golden-rule enforcement — append a dated entry to `CHANGELOG.md`. One entry per session, not per prompt. The entry should be a short summary (a few bullet points) of *what was added or changed and why*, written so a future agent can tell at a glance what is and isn't implemented yet. Skip sessions that only fix typos, update docs, or make no behavioural change.
+
 ## Definition of done (MVP)
 A design partner connects a non-prod AWS account, runs the four detectors in shadow mode, approves a rollback in Slack, watches execute → verify → (on induced failure) auto-revert, and replays the incident from the audit log — with **zero unsafe writes** across the synthetic suite.

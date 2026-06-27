@@ -31,7 +31,7 @@ import {
   ShieldOutlined,
   WarningAmberRounded
 } from "@mui/icons-material";
-import { api, setApiToken, UnauthorizedError } from "./api.js";
+import { api, UnauthorizedError } from "./api.js";
 import { useAuth } from "./hooks/useAuth.js";
 import { LoginPage } from "./pages/LoginPage.js";
 import { Sidebar } from "./components/Sidebar.js";
@@ -104,15 +104,10 @@ function StatCard(props: {
 // Root component
 // ────────────────────────────────────────────────────────────────
 export default function App() {
-  const { token, login, logout } = useAuth();
+  const { loggedIn, login, logout } = useAuth();
   const [health, setHealth] = useState<Health | null>(null);
 
-  // Keep the API client in sync with the current token
-  useEffect(() => {
-    setApiToken(token);
-  }, [token]);
-
-  // Load health to discover authEnabled
+  // Load health to discover authEnabled and mode
   useEffect(() => {
     api
       .health()
@@ -124,13 +119,12 @@ export default function App() {
           mode: "observe",
           contractCount: 0,
           auditChainValid: false,
-          registeredActions: [],
           authEnabled: false
         });
       });
   }, []);
 
-  if (!health) {
+  if (!health || loggedIn === null) {
     return (
       <Stack alignItems="center" justifyContent="center" sx={{ minHeight: "100vh" }}>
         <CircularProgress size={28} />
@@ -138,14 +132,14 @@ export default function App() {
     );
   }
 
-  if (health.authEnabled && !token) {
+  if (loggedIn === false) {
     return <LoginPage onLogin={login} />;
   }
 
   return (
     <AppShell
       initialHealth={health}
-      username={token ? "operator" : "local"}
+      username="operator"
       onLogout={logout}
     />
   );
@@ -488,7 +482,8 @@ function AppShell({
         <DialogTitle>Simulate an incident</DialogTitle>
         <DialogContent>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2.5 }}>
-            Generate a synthetic signal and run it through the same safety pipeline.
+            Generate a synthetic signal and run it through the same classification, contract,
+            policy, and audit pipeline an actual incident uses.
           </Typography>
           <FormControl fullWidth>
             <InputLabel id="incident-type-label">Failure pattern</InputLabel>
@@ -505,8 +500,13 @@ function AppShell({
               ))}
             </Select>
           </FormControl>
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+            Choose the failure pattern you want to rehearse. Maximal will create evidence,
+            evaluate the matching contract, and show the safest next step.
+          </Typography>
           <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>
-            This uses the local mock AWS adapter. No cloud resources are touched.
+            This uses the local mock AWS adapter. No cloud resources are touched, so it is safe
+            for demos, onboarding, and contract reviews.
           </Alert>
         </DialogContent>
         <DialogActions>

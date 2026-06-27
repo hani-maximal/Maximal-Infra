@@ -184,6 +184,7 @@ export interface ServiceContext {
   resources: {
     ecs?: { cluster: string; service: string };
     lambda?: { functionName: string; alias: string };
+    ec2?: { instanceId: string; region: string };
   };
 }
 
@@ -213,3 +214,107 @@ export interface VerificationResult {
   ok: boolean;
   checks: Array<{ metric: string; condition: string; passed: boolean; observed: string }>;
 }
+
+// ---------------------------------------------------------------------------
+// Learning pipeline types
+// ---------------------------------------------------------------------------
+
+// Advisory output of the LLM classifier. Never authorizes an action —
+// only updates the confidence score (conservatively) and provides a
+// structured evidence summary for the audit trail and postmortem.
+export const ClassifierHypothesisSchema = z.object({
+  incidentType: IncidentTypeSchema,
+  confidence: z.number().min(0).max(1),
+  evidenceSummary: z.string().min(1).max(4_000),
+  reasoning: z.string().min(1).max(8_000),
+  calibrationNote: z.string().max(1_000).optional(),
+});
+export type ClassifierHypothesis = z.infer<typeof ClassifierHypothesisSchema>;
+
+// Outcome record written after every terminal incident (CLOSED / ESCALATED).
+// The foundation of the confidence calibration and RAG pipelines.
+export const IncidentOutcomeSchema = z.object({
+  id: z.string().uuid(),
+  tenantId: z.string().uuid(),
+  incidentId: z.string().uuid(),
+  incidentType: IncidentTypeSchema,
+  service: z.string().min(1).max(120),
+  environment: z.string().min(1).max(80),
+  evidenceKinds: z.array(z.string()),
+  evidenceSummary: z.string(),
+  actionType: z.string().nullable(),
+  policyDecision: z.enum(["AUTO", "APPROVE", "ESCALATE"]),
+  verificationPassed: z.boolean().nullable(),
+  rollbackTriggered: z.boolean(),
+  humanOverrode: z.boolean(),
+  timeToResolveMs: z.number().int().nullable(),
+  confidenceAtClassification: z.number().min(0).max(1),
+  createdAt: z.string().datetime(),
+  resolvedAt: z.string().datetime().nullable(),
+});
+export type IncidentOutcome = z.infer<typeof IncidentOutcomeSchema>;
+
+// Per-incident-type, per-confidence-bucket calibration statistics.
+export const CalibrationRecordSchema = z.object({
+  id: z.string().uuid(),
+  tenantId: z.string().uuid(),
+  incidentType: IncidentTypeSchema,
+  confidenceBucketLow: z.number().min(0).max(1),
+  confidenceBucketHigh: z.number().min(0).max(1),
+  sampleCount: z.number().int().nonnegative(),
+  actualSuccessRate: z.number().min(0).max(1),
+  meanTimeToResolveMs: z.number().int().nullable(),
+  computedAt: z.string().datetime(),
+});
+export type CalibrationRecord = z.infer<typeof CalibrationRecordSchema>;
+
+// LLM-drafted contract update pending human review.
+// NEVER auto-applied to autonomy gating without sign-off.
+export const ProposedContractUpdateSchema = z.object({
+  id: z.string().uuid(),
+  tenantId: z.string().uuid(),
+  incidentType: IncidentTypeSchema,
+  proposedYaml: z.string().min(1),
+  rationale: z.string().min(1),
+  basedOnIncidentIds: z.array(z.string().uuid()),
+  status: z.enum(["pending", "approved", "rejected"]),
+  reviewedBy: z.string().nullable(),
+  reviewedAt: z.string().datetime().nullable(),
+  createdAt: z.string().datetime(),
+});
+export type ProposedContractUpdate = z.infer<typeof ProposedContractUpdateSchema>;
+
+// Per-tenant, per-incident-type automation depth configuration.
+// automationDepth controls the approval gate for known contracts and novel-incident routing.
+// Safety invariants (ESCALATE, snapshot+revert, typed actions) are never overridden.
+export const AutomationDepthSchema = z.enum(["CONSERVATIVE", "SUPERVISED", "AUTOMATED"]);
+export type AutomationDepth = z.infer<typeof AutomationDepthSchema>;
+
+export const SubscriptionTierSchema = z.enum(["starter", "team", "scale", "enterprise"]);
+export type SubscriptionTier = z.infer<typeof SubscriptionTierSchema>;
+
+export const TrustConfigSchema = z.object({
+  tenantId: z.string().uuid(),
+  incidentType: z.string().nullable(),
+  automationDepth: AutomationDepthSchema.default("CONSERVATIVE"),
+  novelIncidentConfidenceThreshold: z.number().min(0).max(1).default(0.95),
+  maxBlastRadiusOverride: z.number().int().positive().nullable(),
+  requiresApprovalOverride: z.boolean().nullable(),
+});
+export type TrustConfig = z.infer<typeof TrustConfigSchema>;
+
+// Rolling per-service metric baseline computed by the baseline-learn worker.
+export const ServiceBaselineSchema = z.object({
+  id: z.string().uuid(),
+  tenantId: z.string().uuid(),
+  service: z.string().min(1).max(120),
+  environment: z.string().min(1).max(80),
+  metricName: z.string().min(1).max(120),
+  mean: z.number().nullable(),
+  stddev: z.number().nullable(),
+  p50: z.number().nullable(),
+  p95: z.number().nullable(),
+  sampleCount: z.number().int().nonnegative(),
+  computedAt: z.string().datetime(),
+});
+export type ServiceBaseline = z.infer<typeof ServiceBaselineSchema>;

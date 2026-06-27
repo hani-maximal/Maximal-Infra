@@ -1,5 +1,6 @@
 import { useState } from "react";
 import {
+  Alert,
   Box,
   Button,
   CircularProgress,
@@ -193,6 +194,10 @@ export function ActionPanel(props: {
           Confirm live AWS action
         </DialogTitle>
         <DialogContent>
+          <Alert severity="warning" variant="outlined" sx={{ mb: 2 }}>
+            We ask for confirmation because this step can change AWS state. The action has already
+            passed contract policy; approval is the final human checkpoint.
+          </Alert>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
             This will execute a real AWS action against the following target:
           </Typography>
@@ -218,8 +223,9 @@ export function ActionPanel(props: {
             </Stack>
           </Box>
           <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1.5 }}>
-            A pre-action snapshot will be captured. If verification fails, the action will be
-            automatically reverted.
+            Maximal captures a pre-action snapshot, records the decision in the audit chain, and
+            runs verification after execution. If verification fails, the action will be
+            automatically reverted when rollback is enabled.
           </Typography>
         </DialogContent>
         <DialogActions>

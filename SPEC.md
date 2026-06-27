@@ -1,8 +1,9 @@
-# Maximal MVP — Build Spec
+# Maximal — Product & Build Spec
 
-> **Audience:** a coding agent (Claude Code / Codex) building the first version from scratch.
-> **What this is:** a buildable spec for the *safe-execution control plane* — the trusted layer that turns an incident diagnosis into a **typed, bounded, verified, reversible** AWS remediation, with a complete audit trail.
+> **Audience:** a coding agent (Claude Code / Codex) building Maximal.
+> **What this is:** a multi-tenant SaaS product and its safe-execution engine — the trusted layer that turns an incident diagnosis into a **typed, bounded, verified, reversible** AWS action, with a complete audit trail.
 > **What this is NOT:** an autonomous agent with open-ended production access. Read §3 (Non-goals) and §11 (Safety invariants) before writing any code that touches AWS.
+> **Architecture decision (§17.1 resolved):** Default deployment is **multi-tenant SaaS** (Maximal hosts the control plane; customers connect via managed connectors). Customer-side / VPC deployment is a premium Enterprise tier. See §5b for the platform architecture.
 
 ---
 
@@ -88,52 +89,78 @@ Components: **diagnosis intake**, **classifier**, **service context graph**, **c
 
 ## 5. Tech stack & repo layout
 
-**Decisive choices** (architecture is language-agnostic, but build it this way unless told otherwise). TypeScript is chosen specifically because *typed actions* is a core safety property and AWS SDK v3 gives first-class typed clients.
+**Decisive choices.** TypeScript is chosen because *typed actions* is a core safety property. Next.js is chosen for the SaaS frontend because it gives SSR (landing page SEO), client-side interactivity (dashboard), and API routes in one deployment.
 
+### 5a — Engine (safe-execution core)
 - **Language/runtime:** TypeScript (strict), Node.js 20+.
-- **Validation:** `zod` everywhere (contracts, diagnoses, action params, config). This is load-bearing for safety, not optional.
+- **Validation:** `zod` everywhere. Load-bearing for safety; not optional.
 - **AWS:** AWS SDK v3 — `@aws-sdk/client-ecs`, `client-lambda`, `client-cloudwatch`, `client-cloudwatch-logs`, `client-elastic-load-balancing-v2`, `client-cloudtrail`, `client-sts`.
 - **LLM reasoning:** `@anthropic-ai/sdk` (classification + evidence summarization + postmortem drafting only).
 - **MCP:** `@modelcontextprotocol/sdk` (server + client).
-- **Slack:** `@slack/bolt` (Block Kit, interactivity).
-- **HTTP (webhooks):** `fastify`.
-- **Persistence:** Postgres via `drizzle-orm`. Audit table is **insert-only** with hash chaining.
-- **Jobs/state:** start single-process with a durable `incidents` table + a tick loop; `bullmq` (Redis) optional behind an interface.
+- **Slack:** `@slack/bolt` (Block Kit, interactivity, approval buttons).
+- **HTTP (webhooks / engine API):** `fastify`.
+- **Persistence:** Postgres via `drizzle-orm`. Audit table is **insert-only** with hash chaining. All rows scoped by `tenantId`.
 - **Tests:** `vitest`; `aws-sdk-client-mock` for unit tests; a synthetic-failure harness for integration.
+
+### 5b — SaaS platform (multi-tenant product)
+
+**Deployment model (§17.1 resolved):** Maximal runs centrally. Customers connect via managed connectors — no deployment on their side except a CloudFormation template for the cross-account IAM role. Customer-side (VPC) hosting is an Enterprise add-on.
+
+**Platform stack:**
+- **Frontend + SaaS API:** Next.js 15 (App Router) + React 19 + MUI v7. Serves the landing page, login, and the full dashboard app.
+- **Connector model:**
+  - **AWS** — customer runs one CloudFormation template → cross-account IAM role trusted by Maximal's AWS account. Maximal assumes the role via STS. Read role (broad) + per-service write roles (least-privilege).
+  - **Slack** — Maximal publishes a Slack App. Customer installs via OAuth in 30 seconds. Maximal stores per-workspace bot token.
+  - **GitHub** — Maximal publishes a GitHub App. Customer installs on their org. Maximal gets per-installation tokens.
+  - **PagerDuty / Datadog** — Inbound webhook. Customer pastes Maximal's tenant-scoped webhook URL into their settings. No API key needed on Maximal's side.
+- **Multi-tenancy:** `tenantId` on all DB tables (incidents, audit, contracts, connectors, trust configs). Postgres RLS or application-level scoping. All API routes are tenant-scoped from the session.
+
+**New Next.js API routes (beyond engine proxy):**
+- `POST /api/auth/login` → validates credentials, issues JWT cookie
+- `POST /api/auth/logout` → clears cookie
+- `GET/PATCH /api/connectors` → per-tenant connector credential store
+- `GET/PATCH /api/settings/trust` → per-tenant, per-service trust level config
+- Engine routes (`/api/incidents`, `/api/contracts`, `/api/health`) are proxied to the Fastify engine via `next.config.ts` rewrites.
 
 ```
 maximal/
-  CLAUDE.md                      # agent operating guide + guardrails (read first)
-  SPEC.md                        # this file
-  package.json  tsconfig.json
-  drizzle/                       # migrations
-  contracts/
-    post_deploy_5xx_spike.yaml   # sample provided
-  src/
-    config/            # zod-validated env + account/role config
-    types/             # zod schemas + inferred TS types (§6)
-    intake/
-      mcp-client.ts    # ingest diagnoses from upstream agents
-      detectors/       # one file per incident type (§9.2)
-      normalizer.ts    # upstream/own signal -> typed Incident
-      confidence.ts    # re-score confidence against own evidence
-    context/graph.ts   # service -> resources/owners/deps/allowed actions
-    classifier/        # LLM-assisted incident typing (advisory only)
-    contracts/         # loader, matcher, policy eval, blast-radius
-    executor/
-      action.ts        # RemediationAction interface (§9.6)
-      actions/         # ecs-rollback.ts, lambda-rollback.ts, ecs-force-deploy.ts, rerun-deploy.ts, fix-pr.ts
-      iam.ts           # STS assume-role per service/env
-    verifier/          # windowed verification + auto-rollback
-    learning/          # reusable contract synth + postmortem draft
-    slack/             # bolt app, blocks, approval handlers, timeline
-    audit/             # append-only store, hash chain, replay
-    mcp/server.ts      # expose execute_remediation etc.
-    statemachine/      # incident lifecycle orchestrator
-    api/               # pagerduty/github webhooks
+  CLAUDE.md  SPEC.md  package.json  tsconfig.json  tsconfig.server.json
+  next.config.ts          # Next.js config; proxies engine routes to src/ Fastify
+  middleware.ts           # Protects /app/* — redirects to /login if no session cookie
+  app/                    # Next.js App Router
+    layout.tsx            # Root layout (Providers, fonts)
+    globals.css
+    page.tsx              # Landing page (/)
+    login/page.tsx        # Login (/login)
+    app/                  # Dashboard (/app/*)
+      layout.tsx          # Sidebar + top bar shell
+      page.tsx            # Overview dashboard
+      incidents/
+        page.tsx          # Incident queue with filters
+        [id]/page.tsx     # Incident detail (evidence, audit, approve/deny)
+      contracts/page.tsx  # Contract browser (23 playbooks)
+      connectors/page.tsx # Step-by-step connector setup (AWS/Slack/GitHub/PagerDuty/DD)
+      settings/page.tsx   # Trust levels (observe/approve/bounded-auto) + team
+    api/
+      auth/login/route.ts
+      auth/logout/route.ts
+      connectors/route.ts
+      settings/trust/route.ts
+  components/
+    Providers.tsx          # ThemeProvider wrapper (client component)
+  lib/
+    theme.ts               # MUI dark green theme
+    types.ts               # Shared frontend types
+    api.ts                 # Typed API client (calls engine + Next.js routes)
+  contracts/               # YAML playbooks (23 incident types, loaded by engine at boot)
+  src/                     # Fastify engine (incident state machine, executor, audit)
+    server.ts  app.ts  core.ts  actions.ts  orchestrator.ts  types.ts
+  drizzle/                 # DB migrations
+  infra/
+    tofu/                  # OpenTofu IaC (Fargate/ALB for engine)
+    iam/                   # IAM policy templates for customers
   test/
-    unit/
-    synthetic/         # failure harness + unsafe-write gate
+    safety.test.ts         # §10 invariant tests (unsafe-write gate)
 ```
 
 ---
@@ -426,6 +453,8 @@ These are assertions the build must guarantee. Each maps to a test in `test/synt
 
 Build in this order. Each milestone ends with green tests + a short demo.
 
+- **M0 — SaaS platform shell (DONE).**
+  AC: Next.js app serves landing page, login, dashboard, incidents, contracts, connectors, and settings. MUI dark theme. Middleware protects `/app/*`. `pnpm dev` starts Next.js (port 3000); `pnpm dev:server` starts engine (port 4310). All engine API routes proxied via `next.config.ts`.
 - **M1 — Skeleton, types, audit, contract loader.**
   AC: zod types compile; load + validate the sample contract; append audit records; `verifyChain()` passes; `replay()` returns ordered events.
 - **M2 — Detectors + classifier + context graph (read-only).**
@@ -435,16 +464,18 @@ Build in this order. Each milestone ends with green tests + a short demo.
 - **M4 — Executor + verifier + auto-rollback (ECS + Lambda rollback).**
   AC: in sandbox/localstack, snapshot → execute under approval → verify; on induced verification failure, **auto-revert** restores prior state; all AWS calls audited.
 - **M5 — Approval workflow + autonomy gating.**
-  AC: Level-1 approve/deny works end-to-end; Level-2 triggers only for reversible, in-blast-radius actions; **`unsafe-write.test.ts` (all §10 invariants) passes**.
+  AC: Level-1 approve/deny works end-to-end in both Slack and the dashboard; Level-2 triggers only for reversible, in-blast-radius actions; **`unsafe-write.test.ts` (all §10 invariants) passes**.
 - **M6 — Learning loop + postmortem + fix-as-code PR + MCP server/client.**
   AC: resolved incident emits a postmortem draft + proposed reusable contract; `open_fix_as_code_pr` opens a real PR; MCP `execute_remediation` + `dryRun` callable; ingest from a mock upstream diagnosis normalizes to an `Incident`.
+- **M7 — Multi-tenancy + connector backend.**
+  AC: `tenantId` on all DB tables; AWS connector stores cross-account role ARN per tenant; Slack OAuth flow stores bot token per workspace; per-tenant trust level CRUD works end-to-end; incident list is tenant-scoped.
 
 ## 16. Success metrics & Day-90 gate
 Track: MTTD, MTTA, MTTR; classification accuracy; confidence calibration; rollback success rate; false-positive remediation attempts; **share of incidents resolved without human action** per autonomy level; reversibility SLA (time-to-revert); and a hard **zero-unsafe-write** count.
 **Gate:** enable Level-2 for one reversible action on one service only if classification accuracy, rollback success, and a zero-unsafe-write record clear target thresholds with ≥1 design partner.
 
 ## 17. Open questions (surface, don't guess)
-1. Single-tenant per customer (in their VPC) vs. multi-tenant SaaS for MVP? Affects IAM, data residency, audit isolation.
+1. ~~Single-tenant per customer (in their VPC) vs. multi-tenant SaaS for MVP?~~ **Resolved:** Multi-tenant SaaS is the default. On-prem/VPC is the Enterprise add-on. `tenantId` must be on all schema tables from M1.
 2. "Previous known-good" source of truth for rollback targets — deployment history vs. an explicit `last-good` tag the customer maintains?
 3. Feature-flag provider for `disable_feature_flag` (referenced in contracts) — which one(s) for MVP, or defer the action?
 4. Verification baselines — static thresholds (contract) vs. learned per-service baselines?

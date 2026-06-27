@@ -55,13 +55,13 @@ variable "image_tag" {
 }
 
 variable "desired_count" {
-  description = "Number of Fargate tasks. The in-memory prototype must remain at one."
+  description = "Number of Fargate tasks. Requires enable_database = true to run more than one."
   type        = number
   default     = 1
 
   validation {
-    condition     = var.desired_count == 1
-    error_message = "The current in-memory build must run exactly one task. Add PostgreSQL persistence before scaling out."
+    condition     = var.desired_count >= 1 && var.desired_count <= 2
+    error_message = "desired_count must be 1 or 2. Set enable_database = true before scaling beyond 1."
   }
 }
 
@@ -78,13 +78,13 @@ variable "task_memory" {
 }
 
 variable "maximal_mode" {
-  description = "Runtime autonomy mode. The current deployment is forced to observe until the real AWS adapter is implemented."
+  description = "Runtime autonomy mode: observe (no writes) or remediate (live AWS writes via connector roles)."
   type        = string
   default     = "observe"
 
   validation {
-    condition     = var.maximal_mode == "observe"
-    error_message = "The current build uses a mock AWS adapter and may only be deployed in observe mode."
+    condition     = contains(["observe", "remediate"], var.maximal_mode)
+    error_message = "maximal_mode must be 'observe' or 'remediate'."
   }
 }
 
@@ -141,6 +141,38 @@ variable "tags" {
   description = "Additional tags applied to resources."
   type        = map(string)
   default     = {}
+}
+
+# ── Data-tier feature flags ───────────────────────────────────────────────────
+
+variable "enable_database" {
+  description = "Provision RDS PostgreSQL instances (ops + app) and inject DB credentials via Secrets Manager."
+  type        = bool
+  default     = true
+}
+
+variable "enable_redis" {
+  description = "Provision an ElastiCache Redis cluster for the job queue and learning pipeline."
+  type        = bool
+  default     = true
+}
+
+variable "enable_contracts_bucket" {
+  description = "Provision an S3 bucket for contract storage and proposal hot-reload."
+  type        = bool
+  default     = true
+}
+
+variable "database_instance_class" {
+  description = "RDS instance class for the ops and app PostgreSQL databases."
+  type        = string
+  default     = "db.t3.micro"
+}
+
+variable "redis_node_type" {
+  description = "ElastiCache node type for the Redis cluster."
+  type        = string
+  default     = "cache.t3.micro"
 }
 
 check "dns_configuration" {

@@ -75,7 +75,6 @@ export interface Health {
   mode: "observe" | "approve" | "bounded_auto";
   contractCount: number;
   auditChainValid: boolean;
-  registeredActions: string[];
   authEnabled: boolean;
 }
 

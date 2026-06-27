@@ -20,7 +20,7 @@ const surface = {
   backdropFilter: "blur(18px)"
 };
 
-export function LoginPage({ onLogin }: { onLogin: (token: string) => void }) {
+export function LoginPage({ onLogin }: { onLogin: () => void }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -32,8 +32,8 @@ export function LoginPage({ onLogin }: { onLogin: (token: string) => void }) {
     setBusy(true);
     setError(null);
     try {
-      const { token } = await api.login(username, password);
-      onLogin(token);
+      await api.login(username, password);
+      onLogin();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Login failed");
     } finally {
