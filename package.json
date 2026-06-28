@@ -24,6 +24,7 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.54.0",
     "@aws-sdk/client-auto-scaling": "^3.1075.0",
+    "@aws-sdk/client-cloudwatch": "^3.1075.0",
     "@aws-sdk/client-codedeploy": "^3.1075.0",
     "@aws-sdk/client-ec2": "^3.1075.0",
     "@aws-sdk/client-ecs": "^3.1075.0",

@@ -18,8 +18,9 @@ import {
 import { Orchestrator } from "./orchestrator.js";
 import { TenantRegistry } from "./tenant.js";
 import { HttpHealthDetector } from "./detectors/http-health.js";
+import { CloudWatchAlarmsDetector } from "./detectors/cloudwatch-alarms.js";
 import { createSlackApp, SlackNotifier } from "./slack.js";
-import { AutonomyModeSchema, Incident, IncidentTypeSchema } from "./types.js";
+import { AutonomyModeSchema, Incident, IncidentSchema, IncidentTypeSchema, ServiceContext } from "./types.js";
 import { getRedis } from "./cache/client.js";
 import { CacheKeys, TTL } from "./cache/keys.js";
 import { getDb } from "./db/client.js";
@@ -113,6 +114,48 @@ interface LockState {
 const MAX_ATTEMPTS = 5;
 const LOCK_TIER1_MS = 30 * 60 * 1000;  // 30 minutes
 const LOCK_TIER2_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// ---------------------------------------------------------------------------
+// Ingest helpers — used by POST /api/incidents
+// ---------------------------------------------------------------------------
+
+// Extract resource identifiers from evidence ARNs. Explicit resources provided
+// by the caller always take precedence; this is the best-effort fallback.
+function extractResourcesFromEvidence(evidence: Incident["evidence"]): ServiceContext["resources"] {
+  const resources: ServiceContext["resources"] = {};
+  for (const e of evidence) {
+    const arn = e.location?.resource ?? "";
+    // arn:aws:{service}:{region}:{accountId}:{type}/{id...}
+    const m = arn.match(/^arn:aws:([\w-]+):([\w-]+):\d+:([\w/:-]+)$/);
+    if (!m) continue;
+    const [, svc, region, resourcePath] = m as [string, string, string, string];
+    const parts = resourcePath.split("/");
+    if (svc === "ec2" && parts[0] === "instance" && parts[1] && !resources.ec2) {
+      resources.ec2 = { instanceId: parts[1], region };
+    } else if (svc === "lambda" && parts[0] === "function" && parts[1] && !resources.lambda) {
+      resources.lambda = { functionName: parts[1], alias: "live" };
+    } else if (svc === "ecs" && parts[0] === "service" && !resources.ecs) {
+      if (parts.length >= 3 && parts[1] && parts[2]) {
+        resources.ecs = { cluster: parts[1], service: parts[2] };
+      } else if (parts[1]) {
+        resources.ecs = { cluster: "default", service: parts[1] };
+      }
+    }
+  }
+  return resources;
+}
+
+// Caller-supplied resource block (extends the auto-extracted baseline).
+const IngestResourcesSchema = z.object({
+  ecs: z.object({ cluster: z.string().min(1), service: z.string().min(1) }).optional(),
+  lambda: z.object({ functionName: z.string().min(1), alias: z.string().min(1).default("live") }).optional(),
+  ec2: z.object({ instanceId: z.string().min(1), region: z.string().min(1) }).optional(),
+  git: z.object({ repo: z.string().min(1).regex(/^[\w.-]+\/[\w.-]+$/), baseBranch: z.string().min(1).default("main") }).optional(),
+}).optional();
+
+const IngestBodySchema = IncidentSchema
+  .omit({ id: true, state: true, createdAt: true })
+  .extend({ resources: IngestResourcesSchema });
 
 export async function buildApp(options?: { contractsDir?: string; mode?: string }) {
   let mode = AutonomyModeSchema.parse(options?.mode ?? process.env.MAXIMAL_MODE ?? "observe");
@@ -527,7 +570,92 @@ export async function buildApp(options?: { contractsDir?: string; mode?: string 
     });
   });
 
+  // ---------------------------------------------------------------------------
   // Write endpoints — auth-gated when MAXIMAL_JWT_SECRET is set
+  // ---------------------------------------------------------------------------
+
+  // POST /api/incidents — general ingest endpoint for external sources
+  // (Datadog, PagerDuty, aws_devops_agent webhook adapters).
+  // Creates the incident, seeds ContextGraph with resource metadata extracted
+  // from evidence ARNs (overridable by the caller via `resources`), and returns
+  // the created incident. Call POST /api/incidents/:id/plan after this to begin
+  // the remediation pipeline.
+  app.post(
+    "/api/incidents",
+    { preHandler: requireAuth },
+    async (request, reply) => {
+      const { incidents: tenantIncidents, contexts: tenantContexts, contracts: tenantContracts, orchestrator: tenantOrchestrator, audit: tenantAudit } = await getBundle(request.tenantId);
+
+      const bodyResult = IngestBodySchema.safeParse(request.body);
+      if (!bodyResult.success) {
+        return reply.code(400).send({ error: "Invalid incident payload", detail: bodyResult.error.issues[0]?.message });
+      }
+
+      const { resources: explicitResources, ...incidentFields } = bodyResult.data;
+
+      // Tier check: enforce per-plan service limit
+      const ingestTier = await getTenantTier(request.tenantId);
+      const ingestLimits = getLimits(ingestTier);
+      if (ingestLimits.maxServices !== null) {
+        const existingCount = new Set(tenantIncidents.list().map((i) => i.service)).size;
+        const wouldBeNew = !tenantIncidents.list().some((i) => i.service === incidentFields.service);
+        if (wouldBeNew && existingCount >= ingestLimits.maxServices) {
+          return reply.code(402).send({
+            error: `Starter plan is limited to ${ingestLimits.maxServices} monitored services. Upgrade to Team or higher to add more.`,
+            currentTier: ingestTier,
+            requiredTier: "team" as SubscriptionTier,
+          });
+        }
+      }
+
+      const incidentId = randomUUID();
+      const incident = tenantIncidents.create({
+        id: incidentId,
+        ...incidentFields,
+        state: "DETECTED",
+        createdAt: new Date().toISOString(),
+      });
+
+      // Seed ContextGraph so the orchestrator's plan() can ground action params
+      // and the novel classifier has resource context to work with.
+      // ARN extraction is best-effort; caller-provided resources take precedence.
+      const extractedResources = extractResourcesFromEvidence(incident.evidence);
+      const merged = { ...extractedResources, ...explicitResources };
+      const resolvedResources: ServiceContext["resources"] = {};
+      if (merged.ec2) resolvedResources.ec2 = merged.ec2;
+      if (merged.lambda) resolvedResources.lambda = merged.lambda;
+      if (merged.ecs) resolvedResources.ecs = merged.ecs;
+      if (merged.git) resolvedResources.git = merged.git;
+
+      const matchedContract = tenantContracts.match(incident);
+      tenantContexts.upsert({
+        service: incident.service,
+        environment: incident.environment,
+        dependencies: [],
+        allowedActions: matchedContract?.allowed_actions ?? tenantOrchestrator.actions.list(),
+        resources: resolvedResources,
+      });
+
+      tenantAudit.append({
+        incidentId: incident.id,
+        actor: "system",
+        actorId: null,
+        eventType: "signal",
+        payload: {
+          detector: `maximal.ingest.${incident.source}`,
+          source: incident.source,
+          service: incident.service,
+          environment: incident.environment,
+          evidenceRefs: incident.evidence.map((e) => e.ref),
+          resourcesExtracted: Object.keys(extractedResources),
+          resourcesExplicit: Object.keys(explicitResources ?? {}),
+        },
+      });
+
+      return reply.code(201).send(incident);
+    }
+  );
+
   app.post(
     "/api/incidents/demo",
     { preHandler: requireAuth },
@@ -1299,6 +1427,26 @@ export async function buildApp(options?: { contractsDir?: string; mode?: string 
     );
     app.addHook("onReady", async () => detector.start());
     app.addHook("onClose", async () => detector.stop());
+  }
+
+  // CloudWatch Alarms detector — activated by MAXIMAL_CW_REGION env var.
+  // Uses ambient AWS credentials (env vars, instance profile, or ECS task role).
+  // Set MAXIMAL_CW_ALARM_PREFIX to limit polling to alarms matching a name prefix.
+  const cwRegion = process.env.MAXIMAL_CW_REGION;
+  if (cwRegion) {
+    const cwDetector = new CloudWatchAlarmsDetector(
+      {
+        region: cwRegion,
+        environment: process.env.MAXIMAL_CW_ENV ?? "production",
+        ...(process.env.MAXIMAL_CW_ALARM_PREFIX ? { alarmNamePrefix: process.env.MAXIMAL_CW_ALARM_PREFIX } : {}),
+        pollIntervalMs: Number(process.env.MAXIMAL_CW_INTERVAL_MS ?? 60_000),
+      },
+      incidents,
+      contexts,
+      audit
+    );
+    app.addHook("onReady", async () => cwDetector.start());
+    app.addHook("onClose", async () => cwDetector.stop());
   }
 
   return { app, orchestrator, adapter };

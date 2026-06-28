@@ -24,9 +24,11 @@ import {
   snapshots as pgSnapshots,
 } from "./db/schema.js";
 import { classifyIncident } from "./learning/classifier.js";
+import { classifyNovelIncident, groundParams, NOVEL_CONFIDENCE_FLOOR } from "./learning/novel-classifier.js";
 import { getTrustConfig } from "./trust.js";
 import { emitIncidentUpdate } from "./events.js";
 import type { OutcomeWriterJob, ContractLearnerJob } from "./queue/definitions.js";
+import { ContractSchema } from "./types.js";
 
 const DEFAULT_TENANT_ID =
   process.env.DEFAULT_TENANT_ID ?? "00000000-0000-4000-8000-000000000001";
@@ -40,8 +42,10 @@ export interface PlannedAction {
 export class Orchestrator {
   readonly plans = new Map<string, PlannedAction>();
   readonly snapshots = new Map<string, Snapshot>();
-  // Per-incident classifier hypotheses — used in the postmortem payload
   readonly #hypotheses = new Map<string, ClassifierHypothesis>();
+  // Synthetic contracts built on-the-fly for novel incidents (no YAML contract exists).
+  // Keyed by incidentId so execute() can find them without re-running the classifier.
+  readonly #novelContracts = new Map<string, Contract>();
   readonly tenantId: string;
 
   constructor(
@@ -317,6 +321,154 @@ export class Orchestrator {
       },
     });
 
+    // ── Novel incident path ────────────────────────────────────────────────
+    // When no contract exists and the tenant is not CONSERVATIVE, call Claude
+    // to reason over the evidence and propose a bounded typed action. The
+    // proposal always requires human approval — there is no auto path for
+    // novel incidents. Context must exist (needed for params + blast radius).
+    if (!contract && context && trust.automationDepth !== "CONSERVATIVE") {
+      const proposal = await classifyNovelIncident(
+        incident,
+        context,
+        this.actions.list(),
+      ).catch(() => null);
+
+      if (proposal && proposal.actionType !== "escalate" && this.actions.get(proposal.actionType)
+          && proposal.confidence >= NOVEL_CONFIDENCE_FLOOR) {
+        const action = this.actions.get(proposal.actionType)!;
+
+        // Ground resource identifiers from ServiceContext so Claude's guessed
+        // strings (instanceId, region, functionName, etc.) are replaced with
+        // values we actually know to be correct. Judgment params (counts, sizes,
+        // versions) are left as Claude proposed.
+        const groundedParams = groundParams(proposal.actionType, proposal.params, context);
+
+        // Eagerly validate params with the action's own zod schema. If Claude's
+        // output doesn't parse, fall through to escalation rather than presenting
+        // a broken plan to the human.
+        let parsedParams: unknown;
+        try {
+          parsedParams = action.parseParams(groundedParams);
+        } catch {
+          this.audit.append({
+            incidentId,
+            actor: "system",
+            actorId: null,
+            eventType: "escalation",
+            payload: {
+              reason: "novel_proposal_param_validation_failed",
+              actionType: proposal.actionType,
+              reasoning: proposal.reasoning,
+            },
+          });
+          // fall through to hard-escalate below
+          void parsedParams;
+          return this.#hardEscalate(incident, incidentId, trust, "novel_proposal_param_validation_failed");
+        }
+
+        // Eagerly run preconditions before asking the human — no point presenting
+        // a plan that would immediately fail in execute().
+        const precheck = await action.preconditions(parsedParams as never, context).catch(() => ({ ok: false, reason: "precondition_check_threw" }));
+        if (!precheck.ok) {
+          this.audit.append({
+            incidentId,
+            actor: "system",
+            actorId: null,
+            eventType: "escalation",
+            payload: {
+              reason: "novel_proposal_preconditions_failed",
+              actionType: proposal.actionType,
+              preconditionReason: precheck.reason,
+            },
+          });
+          return this.#hardEscalate(incident, incidentId, trust, `novel_precondition_failed:${precheck.reason}`);
+        }
+
+        // Synthetic contract: conservative defaults, always_human, rollback on failure.
+        const syntheticContract = ContractSchema.parse({
+          incident_type: incident.type,
+          source: [incident.source],
+          detect: {},
+          min_confidence: 0,
+          allowed_actions: [proposal.actionType, "escalate"],
+          approval: {
+            mode: "always_human",
+            blast_radius: {
+              max_affected_services: 1,
+              environments: [incident.environment],
+              allowed_action_types: [], // nothing auto-eligible for novel incidents
+              require_reversible: true,
+            },
+          },
+          verify: {
+            window: "10m",
+            checks: [{ metric: "service_health", condition: "healthy for 5m" }],
+          },
+          rollback_if_failed: true,
+          on_resolve: { draft_postmortem: true, learn_contract: true },
+          notify: { slack_channel: "#prod-incidents" },
+        });
+        this.#novelContracts.set(incidentId, syntheticContract);
+
+        // Novel proposals always require human approval — skip evaluatePolicy().
+        const blastRadius = action.blastRadius(parsedParams as never, context);
+        const novelPolicy: PolicyDecision = {
+          decision: "APPROVE",
+          reasons: ["novel_incident_no_contract_human_required"],
+          blastRadius,
+        };
+
+        const novelPlan: PlannedAction = {
+          actionType: proposal.actionType,
+          params: groundedParams, // store grounded params, not raw Claude output
+          policy: novelPolicy,
+        };
+        this.plans.set(incidentId, novelPlan);
+        this.incidents.persistPlan(incidentId, novelPlan);
+
+        incident = await this.transition(incident, "CONTRACT_MATCHED");
+        this.audit.append({
+          incidentId,
+          actor: "system",
+          actorId: null,
+          eventType: "contract_match",
+          payload: {
+            incidentType: incident.type,
+            minConfidence: 0,
+            novel: true,
+          },
+        });
+        this.audit.append({
+          incidentId,
+          actor: "system",
+          actorId: null,
+          eventType: "policy_decision",
+          payload: {
+            actionType: proposal.actionType,
+            ...novelPolicy,
+            novel: true,
+            classifierReasoning: proposal.reasoning,
+            classifierConfidence: proposal.confidence,
+          },
+        });
+
+        await this.transition(incident, "AWAITING_APPROVAL");
+        this.audit.append({
+          incidentId,
+          actor: "system",
+          actorId: null,
+          eventType: "approval_request",
+          payload: {
+            actionType: proposal.actionType,
+            novel: true,
+            reasoning: proposal.reasoning,
+          },
+        });
+
+        return novelPlan;
+      }
+    }
+
     if (!contract || !context) {
       await this.transition(incident, "ESCALATED");
       this.audit.append({
@@ -327,8 +479,6 @@ export class Orchestrator {
         payload: {
           reason: !contract ? "no_matching_contract" : "missing_service_context",
           automationDepth: trust.automationDepth,
-          // SUPERVISED/AUTOMATED tenants get a contract proposal queued immediately
-          // so the next occurrence has a contract to match against.
           contractProposalQueued: trust.automationDepth !== "CONSERVATIVE",
         },
       });
@@ -464,7 +614,7 @@ export class Orchestrator {
       throw new Error("Approval-required plan has no approval state");
     }
 
-    const contract = this.contracts.match(incident);
+    const contract = this.contracts.match(incident) ?? this.#novelContracts.get(incidentId) ?? null;
     const context = this.contexts.get(incident);
     const action = this.actions.get(plan.actionType);
     if (!contract || !context || !action)
@@ -618,6 +768,25 @@ export class Orchestrator {
   // 2. Queues outcome-writer (writes IncidentOutcome row).
   // 3. For CLOSED: queues contract-learner (drafts proposed contract update).
   //
+  // Shared escalation path for the novel classifier's early-exit cases.
+  async #hardEscalate(
+    incident: Incident,
+    incidentId: string,
+    trust: TrustConfig,
+    reason: string,
+  ): Promise<PlannedAction> {
+    await this.transition(incident, "ESCALATED");
+    this.audit.append({
+      incidentId,
+      actor: "system",
+      actorId: null,
+      eventType: "escalation",
+      payload: { reason, automationDepth: trust.automationDepth },
+    });
+    void this.#persistAndLearn(incidentId, "ESCALATED");
+    throw new Error(reason);
+  }
+
   // NEVER blocks the incident lifecycle — errors are logged, not thrown.
   // ---------------------------------------------------------------------------
   async #persistAndLearn(

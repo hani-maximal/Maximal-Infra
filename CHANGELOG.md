@@ -1,5 +1,37 @@
 # Changelog
 
+## 2026-06-28 — CloudWatch Alarms detector + external ingest endpoint
+
+### CloudWatch Alarms detector
+
+Active polling detector that calls `DescribeAlarms` (StateValue=ALARM) every 60 seconds and creates incidents when alarms fire. No client-side Lambda/SNS setup required — uses the ambient AWS credentials already configured for the adapter.
+
+- **`src/detectors/cloudwatch-alarms.ts`** (new): `CloudWatchAlarmsDetector` follows the same `start()`/`stop()` lifecycle as `HttpHealthDetector`. Tracks `alarmArn → incidentId` to deduplicate; clears entries when alarms return to OK.
+- **`mapAlarmToIncidentType()`**: maps `Namespace`/`MetricName` pairs to Maximal incident types. Covers EC2 (`StatusCheckFailed`, disk), Lambda (`Errors`, `Throttles`, `Duration`), ALB (`5XX`, latency, unhealthy hosts), ECS (`RunningTaskCount`), RDS (`DatabaseConnections`), SQS (`ApproximateNumberOfMessagesVisible`), ElastiCache (`Evictions`), and AutoScaling (`GroupInServiceInstances`). Unknown namespace/metric combinations are silently skipped.
+- **`extractFromAlarm()`**: derives `service` name and `ServiceContext["resources"]` from alarm dimensions (`InstanceId` → ec2, `FunctionName` → lambda, `ClusterName`+`ServiceName` → ecs). Resources are upserted to ContextGraph at incident creation time.
+- Evidence: two items per incident — an `alarm` kind with the full alarm state/reason, and a `metric` kind with threshold/statistic/dimensions.
+- Activated by `MAXIMAL_CW_REGION` env var. Optional `MAXIMAL_CW_ALARM_PREFIX` scopes polling to alarms matching a name prefix. `MAXIMAL_CW_INTERVAL_MS` controls poll frequency (default 60s).
+- **`@aws-sdk/client-cloudwatch`** added as a dependency.
+
+### External ingest endpoint + ContextGraph population
+
+Closes the gap between the `SourceSchema` enum (which listed `datadog`, `pagerduty`, `aws_devops_agent` as valid sources) and the lack of any endpoint for those sources to deliver incidents.
+
+- **`POST /api/incidents`** (new, auth-gated): general ingest endpoint for external webhook adapters. Accepts all `IncidentSchema` fields except `id`, `state`, `createdAt` (server-generated), plus an optional `resources` block that callers can use to supply resource identifiers explicitly.
+- **`extractResourcesFromEvidence()`**: parses `evidence[].location.resource` ARNs to extract EC2 `instanceId`/`region`, Lambda `functionName`, and ECS `cluster`/`service`. Runs automatically at ingest time; explicit caller-provided `resources` take precedence. Seeded into ContextGraph before the incident is stored.
+- **ContextGraph always populated at ingest**: `tenantContexts.upsert()` is called for every external incident immediately after creation so that `orchestrator.plan()` — both the contract executor and the novel classifier — always has `ServiceContext` available. `allowedActions` defaults to the matched contract's allow-list, or all registered actions if no contract matches.
+- **`IngestBodySchema` + `IngestResourcesSchema`**: module-level zod schemas used for request validation; `IngestBodySchema` is `IncidentSchema.omit({ id, state, createdAt }).extend({ resources: IngestResourcesSchema })`.
+- Signal audit record emitted at ingest with `resourcesExtracted` and `resourcesExplicit` keys for observability.
+
+## 2026-06-27 — Novel incident classifier
+
+Replaces the hard-escalate path for incidents with no matching contract. Non-CONSERVATIVE tenants now get a Claude-reasoned action proposal routed through the same human-approval and safety gates as contracted incidents.
+
+- **`src/learning/novel-classifier.ts`** (new): `classifyNovelIncident(incident, context, availableActionTypes)` calls `claude-opus-4-7` with the full evidence set and a catalog of available action types + param shapes. Returns `{ actionType, params, reasoning, confidence }` or null on API failure/parse error. Hallucinated action types are rejected post-parse.
+- **`src/orchestrator.ts` novel path**: when `contracts.match()` returns null and `automationDepth !== "CONSERVATIVE"`, calls the novel classifier. On a valid proposal: builds a synthetic `Contract` (always_human approval, max 1 service blast radius, `require_reversible: true`, `rollback_if_failed: true`) via `ContractSchema.parse()`, stores it in `#novelContracts` keyed by incidentId, sets plan policy to `APPROVE` (human required), transitions to `AWAITING_APPROVAL`. CONSERVATIVE tenants and proposals of `"escalate"` fall through to the existing hard-escalate path.
+- **`execute()` fallback**: `this.contracts.match(incident) ?? this.#novelContracts.get(incidentId)` so the synthetic contract is available when the human approves and execution begins.
+- All safety invariants unchanged: snapshot before execute, revert on verification failure, full audit trail with `novel: true` marker on classification and policy events.
+
 ## 2026-06-27 — Per-tenant connector wiring + Next.js Dockerfile
 
 Connector records in the app DB now drive real AWS adapter selection instead of being decorative, and the Docker image now serves the Next.js frontend instead of the old Vite build.
