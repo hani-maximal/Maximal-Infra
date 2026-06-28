@@ -361,6 +361,12 @@ export class MockAwsAdapter implements AwsAdapterInterface {
 
 // ── Real AWS adapter ──────────────────────────────────────────────────────────
 
+export interface AwsCredentials {
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+}
+
 export class AwsAdapter implements AwsAdapterInterface {
   readonly calls: AwsCall[] = [];
   readonly #ecs: ECSClient;
@@ -372,16 +378,19 @@ export class AwsAdapter implements AwsAdapterInterface {
   readonly #eks: EKSClient;
   readonly #ec2ByRegion = new Map<string, EC2Client>();
   readonly #defaultRegion: string;
+  readonly #credentials: AwsCredentials | undefined;
 
-  constructor(region = "us-east-1") {
+  constructor(region = "us-east-1", credentials?: AwsCredentials) {
     this.#defaultRegion = region;
-    this.#ecs = new ECSClient({ region });
-    this.#lambda = new LambdaClient({ region });
-    this.#asg = new AutoScalingClient({ region });
-    this.#lightsail = new LightsailClient({ region });
-    this.#elbv2 = new ElasticLoadBalancingV2Client({ region });
-    this.#codedeploy = new CodeDeployClient({ region });
-    this.#eks = new EKSClient({ region });
+    this.#credentials = credentials;
+    const cfg = credentials ? { region, credentials } : { region };
+    this.#ecs = new ECSClient(cfg);
+    this.#lambda = new LambdaClient(cfg);
+    this.#asg = new AutoScalingClient(cfg);
+    this.#lightsail = new LightsailClient(cfg);
+    this.#elbv2 = new ElasticLoadBalancingV2Client(cfg);
+    this.#codedeploy = new CodeDeployClient(cfg);
+    this.#eks = new EKSClient(cfg);
   }
 
   #log(api: string, input: unknown): void {
@@ -390,7 +399,8 @@ export class AwsAdapter implements AwsAdapterInterface {
 
   #ec2Client(region: string): EC2Client {
     if (!this.#ec2ByRegion.has(region)) {
-      this.#ec2ByRegion.set(region, new EC2Client({ region }));
+      const cfg = this.#credentials ? { region, credentials: this.#credentials } : { region };
+      this.#ec2ByRegion.set(region, new EC2Client(cfg));
     }
     return this.#ec2ByRegion.get(region)!;
   }

@@ -9,6 +9,10 @@ import { Orchestrator } from "./orchestrator.js";
 import type { ActionRegistry } from "./core.js";
 import type { AutonomyMode } from "./types.js";
 import { getDb } from "./db/client.js";
+import type { AppDb } from "./db/app-client.js";
+import type { GitHubAdapterInterface } from "./github.js";
+import { createActionRegistry } from "./actions.js";
+import { resolveAdapterForTenant, evictTenant } from "./connector-adapter.js";
 
 export interface TenantBundle {
   orchestrator: Orchestrator;
@@ -24,14 +28,24 @@ export interface TenantBundle {
 // single-tenant deploys get the same in-memory instances as before.
 export class TenantRegistry {
   readonly #bundles = new Map<string, TenantBundle>();
-  readonly #actions: ActionRegistry;
+  readonly #actions: ActionRegistry; // fallback for pre-registered default tenant
   readonly #mode: AutonomyMode;
   readonly #contractsDir: string;
+  readonly #github: GitHubAdapterInterface | undefined;
+  readonly #appDb: AppDb | null;
 
-  constructor(actions: ActionRegistry, mode: AutonomyMode, contractsDir: string) {
+  constructor(
+    actions: ActionRegistry,
+    mode: AutonomyMode,
+    contractsDir: string,
+    github?: GitHubAdapterInterface,
+    appDb?: AppDb | null,
+  ) {
     this.#actions = actions;
     this.#mode = mode;
     this.#contractsDir = contractsDir;
+    this.#github = github;
+    this.#appDb = appDb ?? null;
   }
 
   // Pre-register a bundle (used for the default tenant at startup).
@@ -78,11 +92,22 @@ export class TenantRegistry {
       }
     }
 
+    // Resolve AWS adapter: per-tenant connector takes priority over env-var adapter.
+    // Fall back to the global registry on error to avoid crashing bundle creation.
+    let actions: ActionRegistry;
+    try {
+      const awsAdapter = await resolveAdapterForTenant(tenantId, this.#appDb);
+      actions = createActionRegistry(awsAdapter, this.#github);
+    } catch (err) {
+      console.warn(`[tenant] Connector resolve failed for ${tenantId}, falling back to global registry:`, err instanceof Error ? err.message : err);
+      actions = this.#actions;
+    }
+
     const orchestrator = new Orchestrator(
       incidents,
       contracts,
       contexts,
-      this.#actions,
+      actions,
       audit,
       verifier,
       this.#mode,
@@ -93,6 +118,13 @@ export class TenantRegistry {
     this.#bundles.set(tenantId, bundle);
     console.info(`[tenant] Created bundle for tenant ${tenantId} (${contracts.contracts.size} contracts)`);
     return bundle;
+  }
+
+  // Evict a tenant's cached bundle so that the next getOrCreate() rebuilds it
+  // with fresh connector credentials. Call after connector create/delete.
+  evict(tenantId: string): void {
+    this.#bundles.delete(tenantId);
+    evictTenant(tenantId);
   }
 
   // Hot-reload contracts for a tenant from S3. Called on Redis pub/sub reload signal.

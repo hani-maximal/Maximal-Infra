@@ -1,5 +1,58 @@
 # Changelog
 
+## 2026-06-27 — Per-tenant connector wiring + Next.js Dockerfile
+
+Connector records in the app DB now drive real AWS adapter selection instead of being decorative, and the Docker image now serves the Next.js frontend instead of the old Vite build.
+
+- **`AwsAdapter` credentials param**: constructor now accepts an optional `AwsCredentials` argument (`{ accessKeyId, secretAccessKey, sessionToken? }`) passed through to all AWS SDK client constructors including the per-region EC2 client map. No change to existing env-var path.
+- **`src/connector-adapter.ts`** (new): `resolveAdapterForTenant(tenantId, appDb)` — queries the first active connector for a tenant, performs STS `AssumeRole` for `iam_role` connectors, and returns an `AwsAdapter` scoped to those credentials. In-memory map with 55-minute TTL prevents redundant AssumeRole calls. Falls back to env-var `AwsAdapter` or `MockAwsAdapter` when no connector is configured. `evictTenant(tenantId)` clears the cache entry on connector mutation.
+- **`TenantRegistry` extended**: accepts `github?` and `appDb?` constructor params; `getOrCreate()` now calls `resolveAdapterForTenant` and builds a fresh `createActionRegistry(adapter, github)` per tenant so each tenant's AWS and GitHub credentials are isolated. Graceful fallback to global registry if connector resolution fails. New `evict(tenantId)` method clears both the bundle cache and the credential cache.
+- **`src/app.ts`**: passes `github` and `getAppDb()` to `TenantRegistry`; connector `POST` and `DELETE` handlers now call `tenantRegistry.evict(request.tenantId)` so the next request picks up fresh credentials.
+- **`next.config.ts`**: added `output: 'standalone'` for self-contained Next.js server bundle; added missing proxy rewrites for `/api/connectors`, `/api/connectors/:path*`, and `/api/learning/:path*`.
+- **`Dockerfile`** rewritten: three-stage build (`deps` → `builder` → `runner`). Builder runs both `next build` and `tsc -p tsconfig.server.json`. Runner installs prod deps for Fastify separately; Next.js standalone at `./nextjs/` with static assets and public dir copied in. `start.sh` launches Fastify engine in background and Next.js standalone as PID 1.
+- **`start.sh`** (new): starts `dist/src/server.js` in background, execs `nextjs/server.js` as foreground. `trap` on INT/TERM kills the engine before Next.js exits cleanly.
+- **`.dockerignore`** updated: excludes `.next`, `nextjs`, `.env`, `.env.*`, and `infra/tofu/.terraform` from build context.
+
+## 2026-06-26 — EC2 revert-PR action for instance-based deployments
+
+Closes the largest coverage gap for non-containerised services: EC2 instances running code deployed via a CI/CD pipeline had no runtime rollback equivalent to ECS task definition or Lambda alias rollback. The agent can now open a git revert PR automatically and, once merged, the team's existing CD pipeline redeploys.
+
+- **New incident type** `ec2_post_deploy_regression` added to `IncidentTypeSchema` and `incidentTypes` tuple
+- **`deployCorrelation` schema extended**: optional `gitCommitSha` (full 40-char SHA, regex-validated) and `gitRepo` (`owner/repo` format) fields. Detectors that know the triggering commit populate these; the orchestrator reads them to select the right action.
+- **`ServiceContext.resources.git`**: optional `{ repo, baseBranch }` resource added so per-service context can carry the target repository without relying solely on the incident payload.
+- **Five new `GitHubAdapterInterface` methods**: `getBranchHead`, `getCommit`, `createCommit`, `createRef`, `findPullRequestByBranch` — implemented in `GitHubAdapter` (real API calls via Git Data API) and `NullGitHubAdapter` (no-ops for dry-run / tests).
+- **`open_revert_pr` action** registered inside the existing `if (github)` block in `createActionRegistry` — absent when GitHub credentials are not configured, so no tokens are spent on the candidate path.
+  - `preconditions`: fetches current branch HEAD and blocks if `commitSha !== HEAD` — only tip commits can be safely auto-reverted without merge conflict resolution. Non-tip commits escalate.
+  - `captureState`: reads the bad commit and its parent's tree SHA; generates a deterministic branch name (`maximal/revert-{sha8}`) so `revert()` can find the PR later.
+  - `execute`: creates the revert commit via Git Data API (parent tree restored), pushes branch, opens PR with full incident context in the description. PR is the revert mechanism; the human merges and their CD pipeline redeploys.
+  - `revert`: calls `findPullRequestByBranch` by stored branch name and closes the PR if found.
+  - `isReversible: true` — passes blast radius check.
+- **`chooseAction` updated**: new `ec2_post_deploy_regression` switch case prefers `open_revert_pr` when `gitCommitSha` + `gitRepo` are present, falls back to `restart_ec2_instance`. The `ec2_` default path also checks for git fields and promotes `open_revert_pr` ahead of restart for any EC2 incident with deploy correlation.
+- **Registry-presence gate**: `chooseAction`'s candidate filter now checks `this.actions.get(actionType) !== null` before selecting — any action absent from the registry (e.g. `open_revert_pr` without GitHub creds) is skipped silently; next candidate wins.
+- **New contract** `contracts/ec2_post_deploy_regression.yaml`: `open_revert_pr` is auto-eligible under blast radius (PR only — human still merges); `restart_ec2_instance` kept human-gated until validated per service.
+
+## 2026-06-26 — SSE live incident broadcast and cross-instance event bus
+
+Real-time incident state propagation for the dashboard and multi-instance deployments. Not previously documented.
+
+- **`src/events.ts`**: in-process `EventEmitter` bus (`setMaxListeners(256)` for concurrent SSE clients). `emitIncidentUpdate()` fires on every orchestrator state transition and fans out via `PUBLISH mx:incidents:events` when Redis is configured. `subscribeToRedisChannel()` opens a dedicated Redis `SUBSCRIBE` connection per instance and re-emits events from other instances, suppressing its own via a per-process `INSTANCE_ID` guard.
+- **`GET /api/incidents/stream`**: SSE endpoint — `text/event-stream`, 25s heartbeat to prevent proxy timeouts, `X-Accel-Buffering: no` for Nginx/ALB. Per-tenant filtering: only events for `request.tenantId` are forwarded. No auth required on the stream itself — payload is notification-only (`{ incidentId, state, service, incidentType, tenantId, ts }`); actual incident data still requires auth to fetch.
+- **Contract hot-reload signaling** also lives in `events.ts`: `publishContractReload(tenantId)` publishes `mx:contracts:reload:{tenantId}`; `subscribeToContractReloads(handler)` uses `PSUBSCRIBE` with a wildcard so a single subscription covers all tenants. On message, `tenantRegistry.reloadContracts(tenantId)` is called — all running instances hot-reload that tenant's contracts within milliseconds of a proposal being approved.
+- Both Redis subscriptions use a duplicate connection (`getRedisDuplicate()`) so they don't block the main command connection.
+
+## 2026-06-26 — Dockerfile and production container
+
+Production container image. Not previously documented.
+
+- **Multi-stage build** on `node:22-bookworm-slim`:
+  - Build stage: `pnpm install --frozen-lockfile --ignore-scripts` → `vite build` (compiles `ui/` frontend to `public/`) → `tsc -p tsconfig.server.json` (compiles server to `dist/src/`)
+  - Runtime stage: `pnpm install --prod` (no devDependencies), copies `dist/src/`, `public/`, and `contracts/` directory. Runs as `node` user (non-root). Exposes 4310.
+- **Known gap**: the Dockerfile still builds the Vite `ui/` frontend. The Next.js `app/` frontend added in the SaaS frontend session is not yet wired into the image — it runs separately via `pnpm dev` during development. The Dockerfile needs to be updated to run the Next.js build and serve it alongside the Fastify API before the Next.js frontend is used in production.
+
+## 2026-06-26 — Secrets Manager credential seeder
+
+- **`infra/scripts/seed-secrets.sh`**: post-`tofu apply` script that writes integration credentials to the `{name}/app-config` Secrets Manager secret via `aws secretsmanager put-secret-value`. Seeds `jwt_secret`, GitHub App credentials (`github_app_id`, `github_private_key`, `github_installation_id`) or PAT (`github_token`), and Slack tokens (`slack_bot_token`, `slack_channel`). Without this step the ECS task receives the secret but with empty placeholder values from the initial `tofu apply`. DB credentials (`ops-db`, `app-db`) are managed by RDS and do not need seeding. Takes an optional stack name argument (default `maximal`) and AWS profile.
+
 ## 2026-06-26 — IaC staging environment: RDS, Redis, S3, Secrets Manager
 
 Extended the existing OpenTofu stack (`infra/tofu/`) to provision a full staging data tier. All resources are gated by feature flags so the stack still boots cleanly with `enable_database = false` for lightweight deploys.

@@ -166,7 +166,7 @@ export async function buildApp(options?: { contractsDir?: string; mode?: string 
   const orchestrator = new Orchestrator(incidents, contracts, contexts, actions, audit, verifier, mode, DEFAULT_TENANT_ID);
 
   // Per-tenant registry — default tenant's bundle pre-registered for backward compat.
-  const tenantRegistry = new TenantRegistry(actions, mode, contractsDir);
+  const tenantRegistry = new TenantRegistry(actions, mode, contractsDir, github ?? undefined, getAppDb());
   tenantRegistry.register(DEFAULT_TENANT_ID, { orchestrator, contracts, incidents, audit, contexts });
   const getBundle = (tenantId: string) => tenantRegistry.getOrCreate(tenantId, contracts);
 
@@ -1171,6 +1171,8 @@ export async function buildApp(options?: { contractsDir?: string; mode?: string 
         lastTestedAt: connectors.lastTestedAt,
         createdAt: connectors.createdAt,
       });
+    // Evict cached bundle so next request picks up fresh connector credentials.
+    tenantRegistry.evict(request.tenantId);
     return reply.code(201).send(connector);
   });
 
@@ -1189,6 +1191,7 @@ export async function buildApp(options?: { contractsDir?: string; mode?: string 
       return reply.code(404).send({ error: "Connector not found" });
     }
     await appDb.delete(connectors).where(and(eq(connectors.id, id), eq(connectors.tenantId, request.tenantId)));
+    tenantRegistry.evict(request.tenantId);
     return { ok: true };
   });
 

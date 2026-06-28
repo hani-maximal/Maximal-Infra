@@ -4,9 +4,14 @@
 node_modules
 coverage
 dist
+.next
+nextjs
 .maximal
 test
 ui/node_modules
 *.log
 *.tfstate
 *.tfstate.*
+.env
+.env.*
+infra/tofu/.terraform
